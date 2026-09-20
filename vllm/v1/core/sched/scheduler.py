@@ -38,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.flash_pp_balance import PhaseBalance
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -73,6 +74,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.core.sched.flash_pp_phase import PhaseCapture
 
 logger = init_logger(__name__)
 
@@ -322,9 +324,14 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self._flash_pp_phase = PhaseCapture.from_env(
+            self,
+            lambda payload: logger.info("FLASH_PP_PHASE %s", payload),
+        )
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        self._flash_pp_balance = PhaseBalance.from_env(self)
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -1129,6 +1136,13 @@ class Scheduler(SchedulerInterface):
                         # The request cannot be scheduled.
                         break
 
+                if self._flash_pp_balance is not None and self._flash_pp_balance.should_defer(
+                    self, request, num_new_tokens, num_computed_tokens,
+                    num_scheduled_tokens, load_kv_async, num_external_computed_tokens,
+                ):
+                    # Preserve queue order, allocation state and decode/ring cadence.
+                    break
+
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1263,6 +1277,8 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
+                if self._flash_pp_balance is not None:
+                    self._flash_pp_balance.clear(request)
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
@@ -1452,8 +1468,12 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
+        if self._flash_pp_phase is not None:
+            self._flash_pp_phase.before(self, scheduler_output)
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self._flash_pp_phase is not None:
+            self._flash_pp_phase.after(self, scheduler_output)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2304,6 +2324,8 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        if self._flash_pp_phase is not None:
+            self._flash_pp_phase.observe_idle(self)
         return engine_core_outputs
 
     def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:
@@ -2607,9 +2629,13 @@ class Scheduler(SchedulerInterface):
         return kv_xfer_params, ec_xfer_params
 
     def _free_blocks(self, request: Request):
+        if self._flash_pp_balance is not None:
+            self._flash_pp_balance.clear(request)
         assert request.is_finished()
         self._free_request_blocks(request)
         del self.requests[request.request_id]
+        if self._flash_pp_phase is not None:
+            self._flash_pp_phase.observe_idle(self)
 
     @property
     def pause_state(self) -> PauseState:

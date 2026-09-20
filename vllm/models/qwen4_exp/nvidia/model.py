@@ -79,6 +79,7 @@ from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
+from .flash_pp_vocab_ownership import build_pp_vocab_module
 from .qsa import Qwen4ExpQSAAttention
 
 
@@ -391,11 +392,15 @@ class Qwen4ExpModel(nn.Module):
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-            quant_config=vllm_config.quant_config,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
+        self.embed_tokens = build_pp_vocab_module(
+            vllm_config, get_pp_group(), "embedding",
+            lambda: VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            ),
+            StageMissingLayer,
         )
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
@@ -666,11 +671,15 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
+        self.lm_head = build_pp_vocab_module(
+            vllm_config, get_pp_group(), "lm_head",
+            lambda: ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            ),
+            StageMissingLayer,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (

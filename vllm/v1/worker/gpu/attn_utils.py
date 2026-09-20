@@ -12,6 +12,11 @@ from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
 )
+from vllm.v1.attention.backends import flash_gdn_decode_metadata
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -426,6 +431,7 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    flash_gdn_pending = []
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
@@ -490,12 +496,41 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
+                if (
+                    flash_gdn_decode_metadata._ENABLED
+                    and type(attn_metadata_builder) is GDNAttentionMetadataBuilder
+                    and all(k in ("num_accepted_tokens", "num_decode_draft_tokens_cpu")
+                            and v is None for k, v in attn_metadata_extra_kwargs.items())
+                ):
+                    flash_gdn_pending.append((attn_group, attn_metadata_builder,
+                                              common_attn_metadata))
+                    for layer_name in attn_group.layer_names:
+                        attn_metadata[layer_name] = None
+                    continue
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
             for layer_name in attn_group.layer_names:
+                attn_metadata[layer_name] = metadata
+    if flash_gdn_pending:
+        staged = flash_gdn_decode_metadata.try_build_many(
+            [(builder, common) for group, builder, common in flash_gdn_pending],
+            GDNAttentionMetadata,
+        )
+        if staged is None:
+            staged = [builder.build(common_prefix_len=0, common_attn_metadata=common)
+                      for group, builder, common in flash_gdn_pending]
+        elif not getattr(flash_gdn_decode_metadata, "_activation_reported", False):
+            import logging
+            logging.getLogger(__name__).info(
+                "Flash GDN batch staging active: groups=%d requests=%d mamba_cache_mode=none",
+                len(flash_gdn_pending), flash_gdn_pending[0][2].num_reqs,
+            )
+            flash_gdn_decode_metadata._activation_reported = True
+        for (group, builder, common), metadata in zip(flash_gdn_pending, staged):
+            for layer_name in group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
 
