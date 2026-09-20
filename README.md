@@ -1,4 +1,9 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+> This branch preserves the Flash-Next RTX 3090 TP2/PP2 engine modifications.
+> See the [source snapshot, tests, serving profile and rebuild limitations](docs/flash_next/README.md).
+> It is not an upstream release or a newly GPU-qualified build.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
