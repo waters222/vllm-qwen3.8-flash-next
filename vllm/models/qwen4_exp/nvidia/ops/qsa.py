@@ -446,6 +446,279 @@ def _select_config(
     return BLOCK_N, num_warps, num_tiles, num_splits
 
 
+@triton.jit(do_not_specialize=["num_rows", "page_lo", "pages_in_arena"])
+def _qsa_sparse_staged_gqa_kernel(
+    q_ptr,
+    k_arena_ptr,
+    v_arena_ptr,
+    indices_ptr,
+    row_map_ptr,
+    acc_ptr,
+    max_ptr,
+    norm_ptr,
+    output_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_k_block,
+    stride_k_token,
+    stride_k_head,
+    stride_v_block,
+    stride_v_token,
+    stride_v_head,
+    stride_indices_row,
+    stride_output_row,
+    stride_output_head,
+    num_rows,
+    page_lo,
+    pages_in_arena,
+    TOPK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    FIRST_BUCKET: tl.constexpr,
+    LAST_BUCKET: tl.constexpr,
+) -> None:
+    local_row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    row = tl.load(row_map_ptr + local_row)
+
+    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
+
+    head_offsets = tl.arange(0, BLOCK_M)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    column_offsets = tl.arange(0, BLOCK_N)
+    first_head = kv_head * GROUP_SIZE
+    head_mask = head_offsets < GROUP_SIZE
+    query = tl.load(
+        q_ptr
+        + row * stride_q_row
+        + (first_head + head_offsets[:, None]) * stride_q_head
+        + dim_offsets[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+
+    state_head = local_row.to(tl.int64) * NUM_QUERY_HEADS + first_head + head_offsets
+    if FIRST_BUCKET:
+        max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
+        normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    else:
+        max_value = tl.load(max_ptr + state_head, mask=head_mask, other=-1.0e20)
+        normalizer = tl.load(norm_ptr + state_head, mask=head_mask, other=0.0)
+        accumulator = tl.load(
+            acc_ptr + state_head[:, None] * HEAD_DIM + dim_offsets[None, :],
+            mask=head_mask[:, None],
+            other=0.0,
+        )
+
+    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+    tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
+
+    for tile in range(0, tile_end):
+        columns = tile * BLOCK_N + column_offsets
+        logical_token = tl.load(
+            indices_ptr + row * stride_indices_row + columns,
+            mask=columns < TOPK,
+            other=-1,
+        )
+        safe_token = tl.maximum(logical_token, 0)
+        logical_page = safe_token // PAGE_SIZE
+        page_offset = safe_token % PAGE_SIZE
+        arena_page = logical_page - page_lo
+        valid = (
+            (logical_token >= 0) & (arena_page >= 0) & (arena_page < pages_in_arena)
+        )
+        safe_page = tl.maximum(arena_page, 0).to(tl.int64)
+        keys = tl.load(
+            k_arena_ptr
+            + safe_page[None, :] * stride_k_block
+            + page_offset[None, :] * stride_k_token
+            + kv_head * stride_k_head
+            + dim_offsets[:, None],
+            mask=valid[None, :],
+            other=0.0,
+        )
+        values = tl.load(
+            v_arena_ptr
+            + safe_page[:, None] * stride_v_block
+            + page_offset[:, None] * stride_v_token
+            + kv_head * stride_v_head
+            + dim_offsets[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        scores = tl.dot(query, keys)
+        scores *= softmax_scale_log2
+        scores = tl.where(valid[None, :], scores, -1.0e20)
+        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probabilities = tl.where(
+            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        )
+        accumulator = tl.dot(
+            probabilities.to(values.dtype),
+            values,
+            acc=accumulator * alpha[:, None],
+        )
+        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+        max_value = next_max
+
+    if LAST_BUCKET:
+        has_values = normalizer > 0
+        tl.store(
+            output_ptr
+            + row * stride_output_row
+            + (first_head + head_offsets[:, None]) * stride_output_head
+            + dim_offsets[None, :],
+            tl.where(
+                has_values[:, None],
+                accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+                0.0,
+            ),
+            mask=head_mask[:, None],
+        )
+    else:
+        tl.store(max_ptr + state_head, max_value, mask=head_mask)
+        tl.store(norm_ptr + state_head, normalizer, mask=head_mask)
+        tl.store(
+            acc_ptr + state_head[:, None] * HEAD_DIM + dim_offsets[None, :],
+            accumulator,
+            mask=head_mask[:, None],
+        )
+
+
+def qsa_staged_arena_pages(arena_bytes: int, page_bytes: int) -> int:
+    """Number of logical pages the staging arena holds (at least one)."""
+    return max(1, arena_bytes // max(page_bytes, 1))
+
+
+def qsa_sparse_paged_attention_staged(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table_row: torch.Tensor,
+    rows: torch.Tensor,
+    max_logical_page: int,
+    arena: torch.Tensor,
+    use_prefill_config: bool,
+    out: torch.Tensor,
+) -> None:
+    """Run the rows in ``rows`` against host-resident K/V via the arena.
+
+    Caller contract (use the direct path when it cannot be met):
+      * ``rows`` belongs to a single request and ``block_table_row`` is that
+        request's block table row.
+      * ``kv_cache`` is the host (UVA) tensor shaped
+        ``[blocks, num_kv_heads, page_size, 2 * head_dim]`` and ``arena`` is a
+        GPU tensor of the same dtype whose first dimension is a page count.
+    """
+    num_rows = rows.numel()
+    if num_rows == 0:
+        return
+    pages_in_arena = arena.shape[0]
+    page_size = kv_cache.shape[2]
+    head_dim = kv_cache.shape[3] // 2
+    num_kv_heads = kv_cache.shape[1]
+    num_pages = max_logical_page + 1
+    num_buckets = triton.cdiv(num_pages, pages_in_arena)
+
+    group_size = q.shape[1] // num_kv_heads
+    block_m = triton.next_power_of_2(group_size)
+    selection_width = logical_indices.shape[1] - 1
+    block_n, partial_warps, num_tiles, _ = _select_config(
+        num_rows, num_kv_heads, use_prefill_config, selection_width
+    )
+
+    if num_buckets == 1:
+        acc = max_state = norm_state = q
+    else:
+        acc = torch.empty(
+            (num_rows, q.shape[1], q.shape[2]), dtype=torch.float32, device=q.device
+        )
+        max_state = torch.empty(
+            (num_rows, q.shape[1]), dtype=torch.float32, device=q.device
+        )
+        norm_state = torch.empty_like(max_state)
+
+    for bucket in range(num_buckets):
+        page_lo = bucket * pages_in_arena
+        page_hi = min(page_lo + pages_in_arena, num_pages)
+        physical = block_table_row[page_lo:page_hi].to(torch.int64)
+        staged = arena[: page_hi - page_lo]
+        torch.index_select(kv_cache, 0, physical, out=staged)
+        k_arena, v_arena = staged.transpose(1, 2).split(head_dim, dim=-1)
+        _qsa_sparse_staged_gqa_kernel[(num_rows, num_kv_heads)](
+            q,
+            k_arena,
+            v_arena,
+            logical_indices,
+            rows,
+            acc,
+            max_state,
+            norm_state,
+            out,
+            q.stride(0),
+            q.stride(1),
+            k_arena.stride(0),
+            k_arena.stride(1),
+            k_arena.stride(2),
+            v_arena.stride(0),
+            v_arena.stride(1),
+            v_arena.stride(2),
+            logical_indices.stride(0),
+            out.stride(0),
+            out.stride(1),
+            num_rows,
+            page_lo,
+            page_hi - page_lo,
+            TOPK=selection_width,
+            PAGE_SIZE=page_size,
+            GROUP_SIZE=group_size,
+            HEAD_DIM=q.shape[2],
+            NUM_QUERY_HEADS=q.shape[1],
+            NUM_TILES=num_tiles,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            FIRST_BUCKET=bucket == 0,
+            LAST_BUCKET=bucket == num_buckets - 1,
+            num_warps=partial_warps,
+            num_stages=2,
+        )
+
+
+_QSA_ARENA_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def qsa_get_staging_arena(
+    kv_cache: torch.Tensor, arena_bytes: int
+) -> torch.Tensor | None:
+    """Staging arena, shared by every layer on a rank.
+
+    The layers of one forward pass run in sequence, so a single arena can be
+    reused instead of holding one resident buffer per layer.
+    """
+    page_bytes = kv_cache[0].numel() * kv_cache.element_size()
+    pages = qsa_staged_arena_pages(arena_bytes, page_bytes)
+    key = (kv_cache.device, kv_cache.dtype, pages, tuple(kv_cache.shape[1:]))
+    arena = _QSA_ARENA_CACHE.get(key)
+    if arena is None:
+        try:
+            arena = torch.empty(
+                (pages, *kv_cache.shape[1:]),
+                dtype=kv_cache.dtype,
+                device=kv_cache.device,
+            )
+        except torch.OutOfMemoryError:
+            return None
+        _QSA_ARENA_CACHE[key] = arena
+    return arena
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,

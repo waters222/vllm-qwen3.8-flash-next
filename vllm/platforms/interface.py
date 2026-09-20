@@ -64,6 +64,52 @@ def in_wsl() -> bool:
     return "microsoft" in " ".join(platform.uname()).lower()
 
 
+def _qsa_offload_bytes_per_token_per_layer(vllm_config: "VllmConfig") -> int:
+    """GPU-resident bytes per token per full-attention layer under QSA offload.
+
+    The main K/V lives on the host; the GPU keeps a 2-byte slot plus the
+    pooled index key of ``indexer_kv_heads * (indexer_head_dim //
+    indexer_compress_ratio)`` elements.
+    """
+    text_config = vllm_config.model_config.hf_text_config
+    head_dim = getattr(text_config, "indexer_head_dim", 0)
+    ratio = getattr(text_config, "indexer_compress_ratio", 0)
+    heads = getattr(text_config, "indexer_kv_heads", 1)
+    if not head_dim or not ratio:
+        raise ValueError("QSA offload needs indexer_head_dim/indexer_compress_ratio")
+    dtype_size = vllm_config.model_config.dtype.itemsize
+    return 2 + heads * (head_dim // ratio) * dtype_size
+
+
+def _qsa_offload_block_size(vllm_config: "VllmConfig", mamba_page_size: int):
+    """Attention block size for QSA offload, or None to keep the normal path."""
+    import os
+
+    if os.environ.get("VLLM_QSA_KV_OFFLOAD", "0") != "1":
+        return None
+    text_config = vllm_config.model_config.hf_text_config
+    layer_types = getattr(text_config, "layer_types", None)
+    if not layer_types or mamba_page_size <= 0:
+        return None
+    full_attention = sum(kind == "full_attention" for kind in layer_types)
+    if not full_attention:
+        return None
+    pp_size = vllm_config.parallel_config.pipeline_parallel_size
+    layers_per_rank = max(1, full_attention // pp_size)
+    if vllm_config.speculative_config is not None:
+        # The MTP drafter is built on the last PP rank only, and its draft
+        # layers are full_attention, so that rank's QSA group is wider than the
+        # others. block_size is global: size it for the widest rank, or that
+        # group's page passes the mamba page and every block in the shared pool
+        # grows to match it.
+        layers_per_rank += max(
+            1, int(getattr(text_config, "mtp_num_hidden_layers", 1) or 1)
+        )
+    per_token = layers_per_rank * _qsa_offload_bytes_per_token_per_layer(vllm_config)
+    block_size = (mamba_page_size // per_token) // 16 * 16
+    return block_size if block_size >= 16 else None
+
+
 class PlatformEnum(enum.Enum):
     """Enumeration of supported hardware platforms."""
 
@@ -927,6 +973,21 @@ class Platform:
             indexer_align = cls._get_indexer_block_alignment(vllm_config)
             if indexer_align:
                 attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
+
+        qsa_block_size = _qsa_offload_block_size(vllm_config, mamba_page_size)
+        if qsa_block_size is not None:
+            cache_config.block_size = qsa_block_size
+            if cache_config.mamba_cache_mode == "align":
+                cache_config.mamba_block_size = qsa_block_size
+            cache_config.mamba_page_size_padded = mamba_page_size
+            logger.info(
+                "QSA host-KV offload: attention block size %d tokens "
+                "(GPU-resident %d B/token/layer, mamba page %d B).",
+                qsa_block_size,
+                _qsa_offload_bytes_per_token_per_layer(vllm_config),
+                mamba_page_size,
+            )
+            return
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size

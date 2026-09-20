@@ -25,10 +25,8 @@ Typical usage inside a transformer decoder layer::
 import torch
 from torch import nn
 
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-)
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import maybe_prefix
 
 from ..common.hyperconnection import (
@@ -67,6 +65,7 @@ class GatedResidual(nn.Module):
         self,
         config: HyperConnectionConfig,
         use_combine: bool = True,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -88,41 +87,36 @@ class GatedResidual(nn.Module):
             group_size=group_size,
             dtype=config.params_dtype,
         )
-
-        # -- vLLM Linear weights --------------------------------------------
-        # The merged skinny-GEMM shape is physically padded to 16 rows to ensure
-        # good alignment and performant implementation chosen by CuBLAS heuristics.
-        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
+        self.input_mix_weight_down = ReplicatedLinear(
+            self.hyper_hidden_size,
+            self.lora_rank,
+            bias=False,
+            params_dtype=config.params_dtype,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+            return_bias=False,
+            disable_tp=True,
+        )
         if use_combine:
-            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
+            self.block_inject_weight = ReplicatedLinear(
                 self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
-                + ([self.pad_size] if self.pad_size else []),
+                self.hc_count,
                 bias=False,
                 params_dtype=config.params_dtype,
                 quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
+                prefix=maybe_prefix(prefix, "block_inject_weight"),
                 return_bias=False,
                 disable_tp=True,
-            )
-        else:
-            self.input_mix_weight_down = ReplicatedLinear(
-                self.hyper_hidden_size,
-                self.lora_rank,
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down"),
-                return_bias=False,
             )
         self.input_mix_weight_up = ReplicatedLinear(
             self.lora_rank,
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
+            disable_tp=True,
         )
 
     def mix(
@@ -136,13 +130,10 @@ class GatedResidual(nn.Module):
         )
 
         if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            injection = self.block_inject_weight(xn)
         else:
-            lora = self.input_mix_weight_down(xn)
             injection = None
+        lora = self.input_mix_weight_down(xn)
 
         lora = hc_silu(lora, self.hc_count)
         gate = self.input_mix_weight_up(lora)  # [M, D]
@@ -173,13 +164,10 @@ class GatedResidual(nn.Module):
         )
 
         if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            injection = self.block_inject_weight(xn)
         else:
-            lora = self.input_mix_weight_down(xn)
             injection = None
+        lora = self.input_mix_weight_down(xn)
 
         lora = hc_silu(lora, self.hc_count)
         gate = self.input_mix_weight_up(lora)  # [M, D]
