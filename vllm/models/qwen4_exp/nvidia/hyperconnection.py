@@ -33,6 +33,11 @@ from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from .flash_hc_sm86_gemv import hc_down_projection
+from .flash_hc_down_silu_wrapper import hc_down_silu
+from .flash_hc_up_gate_wrapper import hc_up_gate
+from .flash_hc_inject_wrapper import hc_inject
+from .flash_hc_pair_wrapper import hc_down_inject
 from .ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -129,15 +134,11 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            injection = self.block_inject_weight(xn)
-        else:
-            injection = None
-        lora = self.input_mix_weight_down(xn)
-
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        lora, injection = hc_down_inject(
+            self.input_mix_weight_down,
+            self.block_inject_weight if self.use_combine else None,
+            xn, self.hc_count)
+        block_input = hc_up_gate(self.input_mix_weight_up, lora, xn, self.hc_count)
 
         return hidden_states, block_input, injection
 
@@ -163,15 +164,11 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            injection = self.block_inject_weight(xn)
-        else:
-            injection = None
-        lora = self.input_mix_weight_down(xn)
-
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        lora, injection = hc_down_inject(
+            self.input_mix_weight_down,
+            self.block_inject_weight if self.use_combine else None,
+            xn, self.hc_count)
+        block_input = hc_up_gate(self.input_mix_weight_up, lora, xn, self.hc_count)
 
         return hidden_states, block_input, injection
 

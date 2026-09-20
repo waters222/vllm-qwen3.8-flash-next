@@ -229,6 +229,27 @@ def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
 ) -> None:
+    from .flash_gdn_input_sm86 import enable_gdn_input_gemv
+
+    enable_gdn_input_gemv(module, dtype)
+    from .flash_gdn_input_multirow_sm86 import enable_gdn_input_multirow
+
+    enable_gdn_input_multirow(module, dtype)
+    from .flash_gdn_input_tensor_sm86 import enable_gdn_input_tensor
+
+    enable_gdn_input_tensor(module, dtype)
+    from .flash_gdn_ba_sm86 import enable_gdn_ba
+
+    enable_gdn_ba(module, dtype)
+    from .flash_attention_out_sm86 import enable_attention_output_gemv
+
+    enable_attention_output_gemv(module, dtype)
+    from .flash_attention_out_multirow_sm86 import enable_attention_output_multirow
+
+    enable_attention_output_multirow(module, dtype)
+    from .flash_shared_epilogue_sm86 import enable_shared_epilogue
+
+    enable_shared_epilogue(module, dtype)
     plans = _gemm_plans()
     if dtype != torch.bfloat16 or not plans:
         return

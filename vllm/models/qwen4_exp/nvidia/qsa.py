@@ -395,8 +395,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 1, int(getattr(config, "mtp_num_hidden_layers", 1) or 1)
             )
         if self._qsa_kv_offload:
-            if vllm_config.parallel_config.tensor_parallel_size != 1:
-                raise NotImplementedError("QSA host KV currently requires TP=1")
+            if tp_size not in (1, 2):
+                raise NotImplementedError("QSA host KV validated layout requires TP=1 or TP=2")
+            if vllm_config.parallel_config.data_parallel_size != 1:
+                raise NotImplementedError("QSA host KV budget requires DP=1")
+            if self.total_num_kv_heads % tp_size:
+                raise NotImplementedError("QSA host KV requires evenly sharded KV heads")
+            if self.num_kv_heads * tp_size != self.total_num_kv_heads:
+                raise RuntimeError("QSA host KV local head count disagrees with TP layout")
+            # Each rank owns only its local heads. Across both PP stages,
+            # count every TP shard of every layer against the host budget.
+            self._qsa_offload_tp_size = tp_size
+            if self.num_heads % self.num_kv_heads:
+                raise RuntimeError("QSA host KV query/KV head ratio is invalid")
             if vllm_config.num_speculative_tokens > 1:
                 from vllm.logger import init_logger
 
@@ -490,7 +501,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         layer_bytes = (
             num_blocks * self.num_kv_heads * block_size * 2 * self.head_dim * 2
         )
-        total_bytes = layer_bytes * self._qsa_offload_layers
+        # Pinned allocations may be rounded to power-of-two allocator bins.
+        # Budget conservatively for all TP ranks, not only this local shard.
+        reserved_layer_bytes = 1 << (max(1, layer_bytes) - 1).bit_length()
+        total_bytes = (reserved_layer_bytes * self._qsa_offload_layers
+                       * self._qsa_offload_tp_size)
         budget = float(os.environ.get("VLLM_QSA_KV_OFFLOAD_MAX_GIB", "64")) * 2**30
         if total_bytes > budget:
             raise RuntimeError(

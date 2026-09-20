@@ -67,6 +67,7 @@ from .utils import (
     maybe_prefix,
 )
 
+from vllm.models.qwen4_exp.nvidia.flash_shared_epilogue_sm86 import shared_gate_scale
 logger = init_logger(__name__)
 
 
@@ -115,7 +116,7 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            out = shared_gate_scale(self, x, out)
 
         return out
 

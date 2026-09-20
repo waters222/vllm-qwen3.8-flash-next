@@ -7,6 +7,9 @@ from collections.abc import Callable
 
 import torch
 
+from . import flash_moe_layout_sm86
+from . import flash_marlin_down_schedule_sm86
+from . import flash_moe_sum_c1
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
@@ -89,6 +92,7 @@ def _fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
+    use_whole_tile_down: bool = False,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -192,7 +196,9 @@ def _fused_marlin_moe(
             intermediate_cache2, input_dtype
         )
 
-    output = ops.moe_wna16_marlin_gemm(
+    down_gemm = (flash_marlin_down_schedule_sm86.gemm
+                 if use_whole_tile_down else ops.moe_wna16_marlin_gemm)
+    output = down_gemm(
         intermediate_cache2,
         output,
         w2,
@@ -316,7 +322,10 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+    align_routes = (
+        flash_moe_layout_sm86.moe_align_block_size if flash_moe_layout_sm86.supported_marlin_callback(moe_sum, MarlinExperts) else moe_align_block_size
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = align_routes(
         topk_ids,
         block_size_m,
         global_num_experts,
@@ -357,6 +366,9 @@ def fused_marlin_moe(
         intermediate_cache2=intermediate_cache2,
         output=None,
         input_dtype=input_dtype,
+        use_whole_tile_down=flash_marlin_down_schedule_sm86.supported_scope(
+            moe_sum, MarlinExperts, expert_map, global_num_experts, E, topk
+        ),
     ).view(-1, topk, K)
 
     if output is None:
@@ -859,7 +871,11 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
     ) -> None:
-        if expert_map is not None:
+        if flash_moe_layout_sm86._ENABLED and expert_map is None and self._lora_context is None:
+            flash_moe_layout_sm86.moe_sum(input, output)
+        elif flash_moe_sum_c1._ENABLED and self._lora_context is None:
+            flash_moe_sum_c1.moe_sum(input, output, topk_ids, expert_map)
+        elif expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
         else:
             ops.moe_sum(input, output)
