@@ -1,0 +1,40 @@
+Qwen3.8-Flash-Next support for vLLM
+Copyright 2026 Minachist
+
+This product includes software developed by the vLLM Project
+(https://github.com/vllm-project/vllm), licensed under the Apache License,
+Version 2.0. See LICENSE in this directory for the full license text.
+
+The patch files in 3x3090/ and 4x3090/ are derivative works of vLLM. They
+change these files of vLLM 0.29.1rc1.dev47+gdc36fcce9, and each of them stays
+under the Apache License, Version 2.0:
+
+flash-next-vllm.patch, flash-next-decode-01-ple-host-gather.patch and
+flash-next-decode-02-model-state-hook.patch (both directories):
+
+  vllm/models/qwen4_exp/nvidia/model.py
+  vllm/models/qwen4_exp/nvidia/hyperconnection.py
+  vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+  vllm/models/qwen4_exp/nvidia/model_state.py
+  vllm/model_executor/models/config.py
+  vllm/v1/core/kv_cache_utils.py
+  vllm/models/qwen4_exp/nvidia/qsa.py
+  vllm/models/qwen4_exp/nvidia/ops/qsa.py
+  vllm/platforms/interface.py
+
+flash-next-mtp-01-enable.patch (4x3090/ only):
+
+  vllm/models/qwen4_exp/nvidia/mtp.py
+  vllm/models/qwen4_exp/nvidia/qsa.py
+  vllm/platforms/interface.py
+
+The three copies of flash-next-vllm.patch and the two decode patches are
+identical in both directories; each directory is a self-contained build
+context.
+
+Dockerfile and compose.yaml in both directories contain no vLLM code. They are
+licensed under the MIT license, which each file states in its own header, and
+whose full text is in LICENSE.MIT in this directory.
+
+The model weights in the parent directory are not covered by this notice. They
+carry the Qwen Community License 1.0. See LICENSE in the parent directory.

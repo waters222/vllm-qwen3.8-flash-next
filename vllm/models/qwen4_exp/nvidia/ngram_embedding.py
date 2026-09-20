@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import mmap
+import os
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import ClassVar
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -47,6 +51,39 @@ from ..common.ple import PLEVocabParallelEmbedding
 from .ops.ple import ple_ngram_ids
 
 logger = init_logger(__name__)
+
+
+def _ple_compressed_tensors_claims(
+    quant_config: QuantizationConfig,
+    names: list[str],
+) -> bool:
+    """Whether any compressed-tensors config group names one of ``names``."""
+    targets = getattr(quant_config, "target_scheme_map", None) or {}
+    for target in targets:
+        if target.startswith("re:"):
+            try:
+                pattern = re.compile(target[3:])
+            except re.error:
+                continue
+            if any(pattern.fullmatch(name) for name in names):
+                return True
+        elif any(name == target for name in names):
+            return True
+    return False
+
+
+def _ple_method_for_compressed_tensors(
+    quant_config: QuantizationConfig,
+    prefix: str,
+) -> "Qwen4ExpPLEEmbeddingMethod":
+    """Resolve a PLE table against a compressed-tensors checkpoint."""
+    names = [prefix, f"{prefix}.weight", f"{prefix}.shard_0"]
+    if _ple_compressed_tensors_claims(quant_config, names):
+        raise NotImplementedError(
+            f"compressed-tensors claims to quantize the PLE table {prefix}, "
+            "but vLLM has no gather-and-dequantize kernel for it"
+        )
+    return Qwen4ExpPLEUnquantizedEmbeddingMethod()
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -175,6 +212,8 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if quant_config.get_name() == "compressed-tensors":
+            return _ple_method_for_compressed_tensors(quant_config, prefix)
         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
             if quant_config._resolve_quant_algo(prefix) == "FP8":
                 return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -532,6 +571,307 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         return output
 
 
+_PLE_MMAP_PATH_ENV = "VLLM_PLE_MMAP_PATH"
+_PLE_MMAP_REBUILD_ENV = "VLLM_PLE_MMAP_REBUILD"
+_PLE_HOST_GATHER_ENV = "VLLM_PLE_HOST_GATHER"
+
+# numpy has no bfloat16, so rows are gathered through a same-width int view.
+_PLE_STORAGE_NUMPY_DTYPES = {1: np.int8, 2: np.int16, 4: np.int32}
+_PLE_STORAGE_TORCH_DTYPES = {1: torch.int8, 2: torch.int16, 4: torch.int32}
+
+
+class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+    """PLE table left on disk and gathered on the host through a mmap.
+
+    The file is a raw, C-contiguous ``[num_embeddings_padded, embedding_dim]``
+    array in the checkpoint's storage dtype -- the ``shard_0 .. shard_N`` PLE
+    tensors concatenated in index order. ``VLLM_PLE_MMAP_PATH`` points at it;
+    a missing file is created and filled while the checkpoint loads, and an
+    existing one of the expected size is mapped copy-on-write and left alone.
+    ``VLLM_PLE_MMAP_REBUILD=1`` forces a refill.
+
+    Requires ETP=1, checked here.
+
+    The lookup is a host-side gather and cannot run inside a captured CUDA
+    graph -- so it does not run there. ``Qwen4ExpModelState.prepare_inputs``
+    calls :meth:`host_gather` before the forward begins, and :meth:`forward`
+    only reads the buffer it filled. Every cudagraph mode therefore works,
+    ``FULL_DECODE_ONLY`` included; a PIECEWISE mode still needs
+    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` for the eager breaks the GDN, QSA and
+    short-conv layers rely on.
+
+    ``VLLM_PLE_HOST_GATHER=0`` puts the gather back inside the forward, which
+    is the behaviour of earlier releases. It restores the old restriction that
+    FULL cudagraph modes are rejected, and it costs roughly 45% of single
+    stream decode throughput. It exists to A/B the change on one build.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: "Qwen4ExpPLEEmbeddingMethod",
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+    ) -> None:
+        self._mmap_path = os.environ.get(_PLE_MMAP_PATH_ENV, "").strip()
+        if not self._mmap_path:
+            raise RuntimeError(
+                f"{_PLE_MMAP_PATH_ENV} must point at the raw PLE table file"
+            )
+        self._mmap_array: "np.memmap | None" = None
+        self._mmap_prefilled = False
+        # Skips Qwen4ExpPLEPinnedHostEmbedding.__init__, which requires UVA and
+        # builds an accelerator view of pinned memory. Everything else it
+        # defines (start_prefetch / _finalize_prefetch / forward) is reused.
+        Qwen4ExpPLEEmbedding.__init__(
+            self,
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            num_ngram_heads=num_ngram_heads,
+            max_total_tokens=max_total_tokens,
+            data_parallel_rank=data_parallel_rank,
+        )
+        if self.tp_size != 1:
+            raise RuntimeError(
+                "The mmap PLE backend requires ETP=1 because the mapped file "
+                f"holds the whole table; got ETP={self.tp_size}"
+            )
+
+        self.prefetch_from_model_state = (
+            os.environ.get(_PLE_HOST_GATHER_ENV, "1").strip() not in ("", "0")
+        )
+
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        cg_mode = get_current_vllm_config().compilation_config.cudagraph_mode
+        # FULL is allowed because host_gather() runs before the forward, which
+        # leaves forward() a plain device read at a fixed address. With the
+        # gather back inside the forward it cannot be captured at all.
+        if not self.prefetch_from_model_state and cg_mode.has_full_cudagraphs():
+            raise RuntimeError(
+                f"{_PLE_HOST_GATHER_ENV}=0 keeps the host gather inside the "
+                f"forward, where it cannot be captured; cudagraph_mode "
+                f"{cg_mode.name} requires it hoisted out"
+            )
+        if cg_mode.has_piecewise_cudagraphs() and not is_breakable_cudagraph_enabled():
+            raise RuntimeError(
+                f"mmap PLE with cudagraph_mode {cg_mode.name} requires "
+                "VLLM_USE_BREAKABLE_CUDAGRAPH=1"
+            )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        self._block_d = triton.next_power_of_2(self.embedding_dim)
+        self._prefetch_stream = torch.cuda.Stream(device=device)
+        # host_gather() fills this and forward() returns a view of it, so it is
+        # allocated once and never reallocated: a cudagraph replay reads the
+        # same address every time. Zeroed rather than uninitialised so that a
+        # forward running before the first gather sees zeros.
+        self._prefetch_buffer = torch.zeros(
+            max_total_tokens * self.etp_data_parallel_size,
+            num_ngram_heads,
+            self.embedding_dim,
+            dtype=self.weight.dtype,
+            device=device,
+        )
+        self._host_stage = torch.empty(
+            max_total_tokens * self.etp_data_parallel_size * num_ngram_heads,
+            self.embedding_dim,
+            dtype=self.weight.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        storage_dtype = _PLE_STORAGE_TORCH_DTYPES[self.weight.dtype.itemsize]
+        self._host_stage_np = self._host_stage.view(storage_dtype).numpy()
+        self._output_dim = num_ngram_heads * self.embedding_dim
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Map the complete PLE weight from the raw file on disk."""
+        np_dtype = _PLE_STORAGE_NUMPY_DTYPES.get(dtype.itemsize)
+        if np_dtype is None:
+            raise RuntimeError(
+                f"mmap PLE backend cannot represent a {dtype.itemsize}-byte "
+                f"storage dtype ({dtype})"
+            )
+        path = self._mmap_path
+        nbytes = num_embeddings * embedding_dim * dtype.itemsize
+        exists = os.path.exists(path)
+        if exists:
+            actual = os.path.getsize(path)
+            if actual != nbytes:
+                raise RuntimeError(
+                    f"PLE mmap table {path} is {actual} bytes but this model "
+                    f"needs {nbytes} for [{num_embeddings}, {embedding_dim}] "
+                    f"{dtype}. Point {_PLE_MMAP_PATH_ENV} elsewhere or delete "
+                    "the stale file."
+                )
+        rebuild = os.environ.get(_PLE_MMAP_REBUILD_ENV, "0").strip() not in ("", "0")
+        self._mmap_prefilled = exists and not rebuild
+        if not exists:
+            parent = os.path.dirname(os.path.abspath(path))
+            os.makedirs(parent, exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.truncate(nbytes)
+        # Copy-on-write, so a stray write cannot corrupt a shared cache file.
+        mode = "c" if self._mmap_prefilled else "r+"
+        self._mmap_array = np.memmap(
+            path,
+            dtype=np_dtype,
+            mode=mode,
+            shape=(num_embeddings, embedding_dim),
+        )
+        # The lookup is a scattered row gather, so readahead is pure waste.
+        raw_map = getattr(self._mmap_array, "_mmap", None)
+        if raw_map is not None and hasattr(raw_map, "madvise"):
+            try:
+                raw_map.madvise(mmap.MADV_RANDOM)
+            except OSError as err:
+                logger.warning("MADV_RANDOM on the PLE table failed: %s", err)
+        logger.info(
+            "PLE table mapped from %s (%.2f GiB, mode=%s, prefilled=%s)",
+            path,
+            nbytes / (1 << 30),
+            mode,
+            self._mmap_prefilled,
+        )
+        return torch.from_numpy(self._mmap_array).view(dtype)
+
+    def weight_loader(
+        self,
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        checkpoint_start: int | None = None,
+    ) -> None:
+        """Skip the copy when the mapped file already holds the table."""
+        if self._mmap_prefilled:
+            return
+        super().weight_loader(param, loaded_weight, checkpoint_start)
+
+    def finalize_mmap_cache(self) -> None:
+        """Flush a freshly filled table so the next run can skip loading."""
+        if self._mmap_prefilled or self._mmap_array is None:
+            return
+        self._mmap_array.flush()
+        self._mmap_prefilled = True
+        logger.info("PLE table written to %s", self._mmap_path)
+
+    def _lookup(
+        self,
+        input_ids: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Gather the requested rows on the host and copy them to the device."""
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        if output is None:
+            output = torch.empty(
+                expected_shape,
+                dtype=self.weight.dtype,
+                device=input_ids.device,
+            )
+        elif (
+            tuple(output.shape) != expected_shape
+            or output.dtype != self.weight.dtype
+            or output.device != input_ids.device
+        ):
+            raise ValueError(
+                "PLE prefetch output must match the input shape, weight dtype, "
+                "and input device"
+            )
+
+        flat_ids = input_ids.reshape(-1)
+        count = flat_ids.numel()
+        if count:
+            if count > self._host_stage.shape[0]:
+                raise RuntimeError(
+                    f"PLE host staging buffer holds {self._host_stage.shape[0]} "
+                    f"rows but {count} were requested"
+                )
+            # Host gather: needs the ids on the CPU, hence a device sync.
+            ids = flat_ids.to(device="cpu", dtype=torch.int64).numpy()
+            vocab_start = self.shard_indices.org_vocab_start_index
+            vocab_end = self.shard_indices.org_vocab_end_index
+            in_range = (ids >= vocab_start) & (ids < vocab_end)
+            local_ids = np.where(in_range, ids - vocab_start, 0)
+            stage = self._host_stage_np[:count]
+            np.take(self._mmap_array, local_ids, axis=0, out=stage)
+            if not in_range.all():
+                stage[~in_range] = 0
+            output.view(-1, self.embedding_dim).copy_(
+                self._host_stage[:count], non_blocking=True
+            )
+        return output
+
+    prefetch_from_model_state: bool      # set from the environment in __init__
+
+    # The gather runs before the forward, not inside it.
+    #
+    # _lookup() stops the host until the ids reach the CPU. Done inside the
+    # forward, that sync every step destroys the run-ahead that vLLM V2 plus
+    # async scheduling is built on: the host never gets far enough ahead of the
+    # GPU, and the per-layer eager islands (12 GDN + 4 QSA + 1 PLE short conv
+    # per rank) surface as GPU gaps instead of hiding behind the compute. On
+    # 3 x RTX 3090 that capped single stream decode at 45 tok/s against a
+    # 12.6 ms GPU-busy floor; hoisting the gather and enabling FULL_DECODE_ONLY
+    # measured 80 tok/s.
+    #
+    # Note that hoisting alone changes nothing (measured 45.1 tok/s): under
+    # PIECEWISE the eager islands still follow the sync. The value of the hoist
+    # is that it makes a FULL cudagraph mode legal, and that is what pays.
+
+    def host_gather(self, ngram_ids: torch.Tensor) -> None:
+        """Fill the lookup buffer from the host. Runs OUTSIDE the forward.
+
+        The same work start_prefetch() used to do, minus the side stream: the
+        H2D copy lands on the calling stream, which is the stream the forward
+        (or its cudagraph replay) runs on immediately afterwards, so ordering
+        is implicit and no event is needed.
+        """
+        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
+        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
+        self._lookup(
+            gathered_ids,
+            output=self._prefetch_buffer[: gathered_ids.shape[0]],
+        )
+
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """No-op once host_gather() owns the lookup; the old path otherwise."""
+        if self.prefetch_from_model_state:
+            return
+        super().start_prefetch(hidden_states, ngram_ids)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the rows host_gather() staged for this batch.
+
+        A view, so the address is fixed and the read can be captured. ETP is 1
+        for this backend (__init__ enforces it), which makes the ETP all-reduce
+        and the DP row selection that _finalize_prefetch performs both
+        identities -- all that remains of it is the flatten(-2).
+        """
+        if not self.prefetch_from_model_state:
+            return super().forward(hidden_states)
+        return self._prefetch_buffer[: hidden_states.shape[0]].flatten(-2)
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -700,11 +1040,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        if os.environ.get(_PLE_MMAP_PATH_ENV, "").strip():
+            embedding_cls = Qwen4ExpPLEMmapHostEmbedding
+        elif engram_config is not None and engram_config.cpu_offload:
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        else:
+            embedding_cls = Qwen4ExpPLEDeviceEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
@@ -849,6 +1190,30 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
+    def host_gather(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Fill the PLE lookup buffer from the host, before the forward.
+
+        Called by Qwen4ExpModelState.prepare_inputs. Only the mmap backend
+        wants it: its gather reads the ids on the CPU, and doing that inside
+        the forward synchronises the host with the device on every step. A
+        no-op for the device and pinned backends, which prefetch from inside
+        the forward.
+        """
+        embedding = self.ngram_embedding
+        if not getattr(embedding, "prefetch_from_model_state", False):
+            return
+        ngram_ids = self.compute_ngram_ids(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
+        embedding.host_gather(ngram_ids)
+
     def start_prefetch(
         self,
         hidden_states: torch.Tensor,
@@ -859,6 +1224,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
         if not embedding.supports_prefetch:
+            return
+        if getattr(embedding, "prefetch_from_model_state", False):
+            # host_gather() already ran. Recomputing the ids here would put a
+            # kernel back into every forward, and so into every graph replay.
             return
         ngram_ids = self.compute_ngram_ids(
             input_ids,
@@ -931,6 +1300,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        finalize = getattr(self.ngram_embedding, "finalize_mmap_cache", None)
+        if finalize is not None:
+            finalize()
         return loaded
 
 

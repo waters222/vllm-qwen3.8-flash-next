@@ -27,18 +27,34 @@ class Qwen4ExpModelState(MambaHybridModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self._ple_ngram: nn.Module | None = None
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
             return
 
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
-                "not receive the raw input_ids required by PLE. Please run "
-                "with PP=1."
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size > 1:
+            from vllm.distributed.utils import get_pp_indices
+
+            num_layers = int(config.num_hidden_layers)
+            first_start, first_end = get_pp_indices(num_layers, 0, pp_size)
+            stranded = sorted(
+                abs_id - 1
+                for abs_id in config.ple_layer_ids
+                if not (first_start <= abs_id - 1 < first_end)
             )
+            if stranded:
+                raise RuntimeError(
+                    "N-gram PLE embedding requires every PLE layer to live on "
+                    "the first pipeline rank, because later ranks do not "
+                    "receive the raw input_ids that PLE consumes. "
+                    f"pipeline_parallel_size={pp_size} strands decoder "
+                    f"layer(s) {stranded} outside the first rank's range "
+                    f"[{first_start}, {first_end}). Run with PP=1, or "
+                    "repartition with VLLM_PP_LAYER_PARTITION so that the PLE "
+                    "layers stay on rank 0."
+                )
 
         self.ngram_context_len = int(config.ngram_size) - 1
         if self.ngram_context_len <= 0:
@@ -63,6 +79,35 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+
+        # The NVMe-backed PLE table gathers its rows on the host, which means
+        # pulling the n-gram ids down from the device. Inside the forward that
+        # sync runs every step and costs the host its run-ahead, and it also
+        # keeps the PLE lookup out of every CUDA graph. Hoist it here instead:
+        # prepare_inputs already runs on the host immediately before the
+        # forward, and by then input_ids, query_start_loc and the n-gram
+        # context are all final.
+        #
+        # Only the mmap backend opts in, via prefetch_from_model_state; the
+        # device and pinned backends keep prefetching inside the forward. The
+        # PLE layer lives on the first pipeline rank only, so every other rank
+        # finds nothing here and skips the call.
+        for _, module in model.named_modules():
+            embedding = getattr(module, "ngram_embedding", None)
+            if embedding is not None and getattr(
+                embedding, "prefetch_from_model_state", False
+            ):
+                self._ple_ngram = module
+                break
+        if self._ple_ngram is not None:
+            # prepare_dummy_inputs() is given token counts, not tokens.
+            # Profiling and graph capture only need the buffer written, not
+            # meaningful contents, so feed the gather a fixed run of zeros.
+            self._ple_dummy_input_ids = torch.zeros(
+                self.max_num_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def _prepare_ngram_context(
         self,
@@ -106,10 +151,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        if self._ple_ngram is not None:
+            # Exactly what Qwen4ExpModel._start_layer_ple_prefetch used to do
+            # at the top of the forward, one host step earlier. input_ids is
+            # the padded row count the forward will see, so the buffer is
+            # filled for every row the graph reads back.
+            self._ple_ngram.host_gather(
+                input_batch.input_ids,
+                query_start_loc,
+                ngram_context,
+            )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -141,6 +197,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        if self._ple_ngram is not None:
+            # Must run for capture too: forward() reads the buffer, so it has
+            # to hold something the PLE projection can consume while the graph
+            # is being recorded. This runs outside the capture, because
+            # cudagraph_utils calls prepare_dummy_inputs() before entering
+            # torch.cuda.graph().
+            self._ple_ngram.host_gather(
+                self._ple_dummy_input_ids[:num_tokens],
+                query_start_loc,
+                ngram_context,
+            )
         return model_inputs
 
 
