@@ -146,4 +146,33 @@ measurements (two each at2K/8K/16K/32K) passed with zero preemptions. Their
 median input-token/TTFT rates are3935/3912/3817/3807tok/s and decode medians
 114.34/116.74/114.36/104.82tok/s. The32K decode samples92.57/117.06 retain
 timing variability. This is not240K or concurrent long-context qualification.
-Depth1 and a same750MB-cache no-MTP control are still required before selection.
+Depth1 subsequently completed as recorded below; a same750MB-cache no-MTP
+control is still required before selection.
+
+## Completed TP4 Q8 MTP1 matrix and postchecks
+
+The same three-repeat512-token matrix passed all36 batches with zero
+preemptions and expected output overlap. All12 sequential fixture outputs
+match, and all58 concurrent behavior checks passed, including long-array
+overlap1/2/3/4. Runtime/source comparison permits only draft depth, graph sizes
+and container-specific source roots/hostname.
+
+|Class|C1 decode|C2 aggregate|C3 aggregate|C4 aggregate|
+|---|---:|---:|---:|---:|
+|Math|98.08|190.20|247.45|321.62|
+|Code|89.01|184.43|250.58|327.00|
+|Prose|79.08|174.27|243.48|294.79|
+
+Acceptance C1/C2/C3/C4: math89.62/89.27/88.42/89.62%,
+code93.20/92.23/91.67/92.17%, prose70.94/70.44/71.48/69.06%.
+On the equal-weight concurrent score, depth1/depth3 is0.8664, compared with
+depth2/depth3 at0.9682 and depth4/depth3 at0.9843. Depth3 provisionally leads
+the tested workload mix; the small margins among2--4 do not establish
+statistical separation or a universal optimum. All repeats, including slow
+C1 samples, are retained. Artifacts are in the operations repository under
+`tp4-current/q8-mtp1-hc/`.
+
+The matched no-MTP control uses the same750MB cache, source payloads, host
+KV allowance and runtime configuration, excluding speculation/Q8 flags and
+the graph sizes required by drafting. Its comparison remains pending. No
+production setting has changed.
