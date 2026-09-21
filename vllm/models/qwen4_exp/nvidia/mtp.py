@@ -129,18 +129,32 @@ def _draft_int8_targets(vllm_config, start_layer_idx, environ=None):
     config = vllm_config.model_config.hf_text_config
     parallel = vllm_config.parallel_config
     spec = vllm_config.speculative_config
+    tp4_flag = env.get("VLLM_FLASH_TP4_MTP_Q8", "0")
+    if tp4_flag not in ("0", "1"):
+        raise ValueError("VLLM_FLASH_TP4_MTP_Q8 must be 0 or 1")
+    topology_ok = (
+        parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 2
+        and tp4_flag == "0"
+    )
+    if tp4_flag == "1":
+        topology_ok = (
+            parallel.tensor_parallel_size == 4
+            and parallel.pipeline_parallel_size == parallel.data_parallel_size == 1
+            and env.get("VLLM_FLASH_TP4_MARLIN_K32", "0") == "1"
+            and env.get("VLLM_FLASH_MTP_INT8_LOW_PEAK", "0") == "1"
+        )
     if not (
         config.model_type == "qwen4_exp_text"
         and config.hidden_size == 2560
         and config.num_hidden_layers == start_layer_idx == 48
         and config.mtp_num_hidden_layers == 1
-        and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 2
+        and topology_ok
         and not parallel.enable_expert_parallel
         and spec is not None
         and spec.method == "mtp"
         and 1 <= spec.num_speculative_tokens <= 4
     ):
-        raise ValueError("Draft INT8 pilot requires Flash-Next TP2/PP2 MTP1--4")
+        raise ValueError("Draft INT8 requires TP2/PP2 or explicit TP4/PP1 MTP1--4")
     return {"mtp.layers.48.mlp.experts": "int8_per_channel_weight_only"}
 
 

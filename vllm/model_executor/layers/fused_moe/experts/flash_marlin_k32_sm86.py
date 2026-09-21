@@ -31,6 +31,19 @@ def validate_config(config, environ=None):
         raise ValueError("VLLM_FLASH_TP4_MARLIN_K32 must be 0 or 1")
     text = config.model_config.hf_text_config
     parallel = config.parallel_config
+    mtp_flag = env.get("VLLM_FLASH_TP4_MTP_Q8", "0")
+    if mtp_flag not in ("0", "1"):
+        raise ValueError("VLLM_FLASH_TP4_MTP_Q8 must be 0 or 1")
+    spec = config.speculative_config
+    speculation_ok = spec is None and mtp_flag == "0"
+    if mtp_flag == "1":
+        speculation_ok = (
+            spec is not None
+            and spec.method == "mtp"
+            and 1 <= spec.num_speculative_tokens <= 4
+            and env.get("VLLM_FLASH_MTP_INT8_EXPERTS", "0") == "1"
+            and env.get("VLLM_FLASH_MTP_INT8_LOW_PEAK", "0") == "1"
+        )
     if not (
         text.model_type == "qwen4_exp_text"
         and text.hidden_size == 2560
@@ -38,12 +51,12 @@ def validate_config(config, environ=None):
         and parallel.tensor_parallel_size == 4
         and parallel.pipeline_parallel_size == parallel.data_parallel_size == 1
         and not parallel.enable_expert_parallel
-        and config.speculative_config is None
+        and speculation_ok
         and config.lora_config is None
         and config.scheduler_config.max_num_batched_tokens <= 2048
         and env.get("VLLM_FLASH_TP4_CHUNKED_REPACK", "0") == "0"
     ):
-        raise ValueError("K32 pilot requires Flash-Next TP4/PP1/noEP/noMTP")
+        raise ValueError("K32 requires TP4/PP1/noEP, no MTP or explicit Q8 MTP1--4")
     return True
 
 

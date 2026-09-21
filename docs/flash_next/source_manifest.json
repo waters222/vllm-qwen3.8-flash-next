@@ -2,6 +2,7 @@
   "upstream_commit": "dc36fcce902a63eab06c1b93a5c4a5ee178a0c56",
   "validated_image_id": "sha256:0f75571247e58cfe09d11fe9c6d5dce6b7e2c7da9dfeb6c3e1a2607a7c7e5599",
   "post_snapshot_sources": {
+    "vllm/model_executor/layers/fused_moe/experts/flash_marlin_k32_sm86.py": "535da9af8f6e30cd9ac2721a56986c33e20142d1b4a4de37451179993e02e4be",
     "vllm/models/qwen4_exp/nvidia/qsa.py": "6122fe2c0bad312a5bb7d244579d2d6d43d20e5fbd5c80fbebb1b484c6b9be90",
     "vllm/model_executor/layers/fused_moe/oracle/int_wna16.py": "dd2f772b1684c7c46d96876941153a57f3c4158833cd16095efff57de9ee7673",
     "vllm/v1/core/sched/flash_pp_balance.py": "55c7c3f42bc231f31bdbbc8bb085c3bb8b13197913183df6634f7f9afc43df83",
@@ -9,10 +10,10 @@
     "vllm/model_executor/layers/fused_moe/experts/flash_moe_layout_sm86.py": "2a336e127cdc855fd6d49efa2ee292f4f9ec5b58509fcd2c15cd64002d033c95",
     "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": "8f95e58cdc75891054fbbe249e754cb257db60caaaf26d6a5ea02d1db52bf6e7",
     "vllm/platforms/interface.py": "2465e7a82013ad3606a95075dd2cdac436583b8a5c2665e2ff502b3964ac6d68",
-    "vllm/models/qwen4_exp/nvidia/mtp.py": "1298b7f49f80818221bfe5394ff9001572a778f9d2146bb64358ef601ffc8300",
+    "vllm/models/qwen4_exp/nvidia/mtp.py": "fddd33878d4cc876f938dfec9affb5bd40caa13cc4e997f3032e8775f57998f7",
     "vllm/v1/core/sched/flash_pp_phase.py": "65ab6875b465f009316cdf83abca7a0ad8c7c80f4720175310860ad430cd836e"
   },
-  "post_snapshot_note": "MTP padding correction, opt-in QSA page cap, draft-only INT8 experts, MTP1 pair-admission pilot, TP4 chunked repack/QSA layout pilot, and default-off unpadded TP4 Marlin K32 integration. These sources differ from the historical validated image. K32 passed integrated one-layer checks, not full-model qualification. Original engine_sources hashes remain historical provenance except explicitly listed new experimental files; int_wna16.py adds its previously unchanged upstream/image baseline to the allowlist.",
+  "post_snapshot_note": "MTP padding correction, opt-in QSA page cap, draft-only INT8 experts, MTP1 pair-admission pilot, TP4 chunked repack/QSA layout pilot, and default-off unpadded TP4 Marlin K32 integration with explicit TP4 Q8 MTP gates. These sources differ from the historical validated image. K32 passed integrated one-layer checks plus bounded full-model TP4 no-MTP and Q8 MTP3 screens; concurrency gains remain workload-dependent. This is not broad model-quality, production or clean-image qualification. Original engine_sources hashes remain historical provenance except explicitly listed new experimental files; int_wna16.py adds its previously unchanged upstream/image baseline to the allowlist.",
   "engine_sources": {
     "vllm/model_executor/layers/fused_moe/experts/flash_marlin_k32_sm86.py": "454145e0f989f01ff25843184608909207fac4a073a766f85481380483ccb372",
     "vllm/model_executor/layers/fused_moe/oracle/int_wna16.py": "cfffe8b8b290330be9d18ffa07aeecf296484395ff04df3147d99393e48b55c1",

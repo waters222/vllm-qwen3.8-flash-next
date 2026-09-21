@@ -64,6 +64,30 @@ class DraftInt8Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.targets(None, None, {"VLLM_FLASH_MTP_INT8_EXPERTS": "yes"})
 
+    def test_tp4_requires_explicit_gate_without_changing_target_quantization(self):
+        self.config.parallel_config.tensor_parallel_size = 4
+        self.config.parallel_config.pipeline_parallel_size = 1
+        self.config.parallel_config.data_parallel_size = 1
+        env = {
+            "VLLM_FLASH_MTP_INT8_EXPERTS": "1",
+            "VLLM_FLASH_TP4_MTP_Q8": "1",
+            "VLLM_FLASH_TP4_MARLIN_K32": "1",
+            "VLLM_FLASH_MTP_INT8_LOW_PEAK": "1",
+        }
+        original = copy.deepcopy(self.config)
+        self.assertEqual(
+            self.targets(self.config, 48, env),
+            {"mtp.layers.48.mlp.experts": "int8_per_channel_weight_only"},
+        )
+        self.assertEqual(self.config, original)
+        for key in env:
+            if key == "VLLM_FLASH_MTP_INT8_EXPERTS":
+                continue
+            with self.assertRaises(ValueError):
+                self.targets(
+                    self.config, 48, {k: v for k, v in env.items() if k != key}
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

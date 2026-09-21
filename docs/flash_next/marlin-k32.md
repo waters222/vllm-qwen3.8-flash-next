@@ -43,7 +43,41 @@ padded chunked repacking. It pins the private library and native extension.
 The source-preservation export includes its builder and compilation recipe;
 the complete updated Dockerfile has not yet been clean-build GPU-qualified.
 
-Full-model no-MTP control is loading on the development quartet. Model output,
-memory feasibility and end-to-end speed remain unproven. MTP follows only
-after that control qualifies. Unequal128/192 sharding remains an unintegrated
-fallback prototype.
+Full-model no-MTP control reached Ready on the development quartet at about
+21.18GiB/device (19.96GiB reported model allocations). All twelve bounded
+outputs match the retained fixture. Three512-token repeats across math/code/
+prose and C1--4 completed. Math C1 decode88.86tok/s; C2--4 aggregate
+138.04/193.45/244.29tok/s. This is not broad model-accuracy qualification or a
+promotion. Eight C1 context tests through32K also completed.
+
+The separate `VLLM_FLASH_TP4_MTP_Q8=1` gate permits MTP1--4 with both draft
+INT8 flags required. Four distributed ranks passed real512-expert conversion
+checks: lower-peak and native weights/scales are bit-exact, selected scales
+match an independent whole-checkpoint reduction, and transient peak drops
+212.81MiB/rank. Only draft experts are quantized; target checkpoint AWQ is
+unchanged. Draft activations remain BF16 (W8A16), not W8A8.
+
+Full TP4 Q8 MTP3 reached Ready at about22.66GiB/device (20.81GiB reported
+model allocations). All twelve fixture outputs match and all36 batches pass
+token/timing/acceptance audits, with zero recorded preemptions. The fixture
+retains its known11/12 strict score due to a case-sensitive capitalization
+mismatch. These are short-prompt, seed17, thinking-off,512-output-token
+medians; C1 decode and concurrent aggregate are different metrics.
+
+| Prompt | C1 decode | C2 aggregate | C3 aggregate | C4 aggregate |
+| --- | ---: | ---: | ---: | ---: |
+| Math |164.77|177.80|240.93|297.59|
+| Code |172.10|195.94|266.95|323.62|
+| Prose |122.19|130.52|189.42|215.32|
+
+Math acceptance remains73--75% across C1--4, code83--85%, prose43--46%.
+Prose concurrent throughput regresses against the no-MTP control. The MTP
+trial allocates750MB GPU cache/rank versus275MB in the control; both retain
+56GiB host-QSA allowance and240K configured context. Four requests were
+observed active; this does not prove every graph forms an efficient batch.
+
+The MTP4 depth screen is ongoing. C>=2 profiling at fixed TP4/PP1 follows;
+balanced-depth selection and general concurrency scaling remain unresolved.
+Unequal128/192 sharding remains an unintegrated fallback prototype. The
+complete source-built image remains unqualified; these results use pinned
+overlays on the retained evaluation image, not a clean rebuild.

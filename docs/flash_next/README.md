@@ -14,7 +14,9 @@ broader concurrency screen remains mixed, and [lower-peak TP4 repacking](tp4-chu
 which passed a real-layer bitwise/memory probe but is not yet full-model qualified.
 The subsequent full Marlin load still failed VRAM allocation. A
 [native unpadded K32 specialization](marlin-k32.md) now has passing real-weight
-small-row and prefill/graph screens; guarded integration is being validated.
+small-row and prefill/graph screens, full-model TP4 no-MTP measurements, and
+a completed TP4 Q8 MTP3 short-prompt concurrency screen. MTP concurrent gains
+remain workload-dependent; profiling and depth selection are still in progress.
 It is default-off and is not part of the historical serving image.
 Revised source files are tracked separately from the original image hashes;
 the byte-for-byte preservation statements below describe the snapshot.

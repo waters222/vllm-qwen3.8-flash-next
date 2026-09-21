@@ -49,6 +49,30 @@ class K32GateTests(unittest.TestCase):
         self.assertTrue(self.gate(self.config, {"VLLM_FLASH_TP4_MARLIN_K32": "1"}))
         self.assertEqual(self.config, original)
 
+    def test_mtp_requires_separate_q8_gate_and_both_quantization_flags(self):
+        env = {
+            "VLLM_FLASH_TP4_MARLIN_K32": "1",
+            "VLLM_FLASH_TP4_MTP_Q8": "1",
+            "VLLM_FLASH_MTP_INT8_EXPERTS": "1",
+            "VLLM_FLASH_MTP_INT8_LOW_PEAK": "1",
+        }
+        for depth in (1, 2, 3, 4):
+            self.config.speculative_config = NS(
+                method="mtp", num_speculative_tokens=depth
+            )
+            self.assertTrue(self.gate(self.config, env))
+        for key in env:
+            if key == "VLLM_FLASH_TP4_MARLIN_K32":
+                continue
+            with self.assertRaises(ValueError):
+                self.gate(self.config, {k: v for k, v in env.items() if k != key})
+        self.config.speculative_config = NS(method="mtp", num_speculative_tokens=5)
+        with self.assertRaises(ValueError):
+            self.gate(self.config, env)
+        self.config.speculative_config = None
+        with self.assertRaises(ValueError):
+            self.gate(self.config, env)
+
     def test_other_topologies_speculation_or_precision_context_fail_closed(self):
         variants = [
             ("parallel_config", "tensor_parallel_size", 2),
