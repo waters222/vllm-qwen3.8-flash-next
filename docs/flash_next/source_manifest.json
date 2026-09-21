@@ -1,7 +1,7 @@
 {
   "upstream_commit": "dc36fcce902a63eab06c1b93a5c4a5ee178a0c56",
   "validated_image_id": "sha256:0f75571247e58cfe09d11fe9c6d5dce6b7e2c7da9dfeb6c3e1a2607a7c7e5599",
-  "hc_injection_mtp_note": "Default-off M5--16 HC injection extension is experimental. Operator, whole-layer and registered-op GPU/fake/compile checks passed. TP4 Q8 MTP3 completed bounded sequential/concurrent behavior and repeated C1--4 throughput screens: concurrent gains22.9--36.7%, unresolved prose C1 slowdown. No production promotion or balanced-depth selection. See hc-inject-mtp.md.",
+  "hc_injection_mtp_note": "Default-off M5--16 HC injection extension is experimental. Operator, whole-layer and registered-op GPU/fake/compile checks passed. TP4 Q8 MTP3 and MTP4 completed bounded sequential/concurrent behavior and repeated C1--4 throughput screens. MTP3 concurrent gains22.9--36.7%; MTP4 slightly leads patchedMTP3 for code but loses about10% for prose C3/C4. Intermittent C1 timing slowdowns remain unresolved. No production promotion or balanced-depth selection. See hc-inject-mtp.md.",
   "post_snapshot_sources": {
     "vllm/models/qwen4_exp/nvidia/flash_hc_inject_multirow.py": "32ecf5b6963b5ef74d2d7a60797d9edf2f2c5ed6406e05ca1587a821c5da8de2",
     "vllm/models/qwen4_exp/nvidia/flash_hc_inject_wrapper.py": "f43fd5089971aaaf6686fe1d9687c8fea6ffd29b7d97332626984288a3e801e5",

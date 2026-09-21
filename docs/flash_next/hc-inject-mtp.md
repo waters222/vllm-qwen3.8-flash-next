@@ -21,7 +21,7 @@ A whole-layer prototype with actual TP2 reductions passed64-step output/state
 and changed-input graph checks at M4/5/8/12/16/20. M4 was unchanged and exact;
 recurrent states matched exactly. Native/candidate rank0 layer times (us):
 
-| M | Native | Candidate |
+|M|Native|Candidate|
 |---|---:|---:|
 |4|358.62|359.97|
 |5|576.87|380.52|
@@ -57,7 +57,7 @@ and old source payloads match previous MTP3 except the two HC source overlays,
 one feature flag and generated container hostname. Three512-token repeats per
 class/concurrency, seed17 and thinking off:
 
-| Class | C1 decode | C2 aggregate | C3 aggregate | C4 aggregate |
+|Class|C1 decode|C2 aggregate|C3 aggregate|C4 aggregate|
 |---|---:|---:|---:|---:|
 |Math|164.07|243.06|316.50|372.42|
 |Code|167.28|240.74|339.04|406.26|
@@ -78,6 +78,40 @@ Greedy free-form outputs varied in both old and new runs, including noMTP;
 token equality is not asserted and this is not broad model-quality evaluation.
 
 NoMTP comparisons retain a cache-budget difference (275MB versus750MB/rank).
-Depth1/2/4 comparisons and the balanced default remain pending. Full-model
+Depth1/2 comparisons and the balanced default remain pending. Full-model
 performance evidence and raw data are in the operations repository's
 `tp4-current/q8-mtp3-hc/` benchmark directory.
+
+## Completed TP4 Q8 MTP4 full-model screen
+
+The next depth uses identical source payloads, cache paths, memory budgets
+and runtime configuration except speculative depth, required graph sizes and
+container-specific source roots/hostname. Three512-token repeats per class/C:
+
+|Class|C1 decode|C2 aggregate|C3 aggregate|C4 aggregate|
+|---|---:|---:|---:|---:|
+|Math|168.13|235.99|313.60|361.54|
+|Code|165.47|251.03|352.25|418.28|
+|Prose|110.72|167.36|214.48|253.99|
+
+All36 batches pass the same audits with zero preemptions and expected output
+overlap. All12 sequential fixture outputs match, and separate concurrent
+checks pass58/58, including long-array overlap1/2/3/4. This is bounded
+behavior qualification, not broad model-quality evaluation.
+
+Relative to patchedMTP3, concurrent code gains3.0--4.3%; math changes
+-0.9 to-2.9%; prose C2 gains2.9% but C3/C4 lose10.5%/9.6%. Fourth-position
+acceptance per draft is11.5--12.9% for concurrent prose and59.7--62.6% for
+concurrent code. More draft tokens are not uniformly better.
+
+Relative to unpatched same-depth4, C1 improves27.2--42.8%, C2/C3 improve
+22.3--29.4%, and C4 changes-1.6 to+4.1%. C4's20-row target verification is
+outside the new HC gate. These are end-to-end observations across retained
+windows, not isolated kernel measurements.
+
+Keep the variation: math C1 samples are168.13/101.73/169.41tok/s. The slower
+sample has higher acceptance but client intervals near41ms rather than22ms.
+The intermittent slowdown is not specific to prose. Client intervals cannot
+separate GPU work, scheduling or transport; its cause remains unresolved.
+Artifacts are under the operations repository's `tp4-current/q8-mtp4-hc/`.
+No production promotion or final balanced-depth selection has been made.
