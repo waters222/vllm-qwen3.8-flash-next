@@ -69,6 +69,105 @@ def established(key="old", eligible=3081):
 
 
 class BalanceTests(unittest.TestCase):
+    def mtp_scheduler(self, step=1):
+        s = scheduler(step)
+        s.num_spec_tokens = 1
+        s.vllm_config.speculative_config = NS(method="mtp", num_speculative_tokens=1)
+        s.parallel_config.tensor_parallel_size = 2
+        s.parallel_config.enable_expert_parallel = False
+        s.max_num_running_reqs = 4
+        return s
+
+    def mtp_helper(self, s):
+        return PhaseBalance.from_env(
+            s,
+            {
+                "VLLM_FLASH_PP_BALANCE": "1",
+                "VLLM_FLASH_PP_MTP_PAIRS": "1",
+            },
+        )
+
+    def test_mtp_pairs_require_explicit_depth_and_topology_gate(self):
+        s = self.mtp_scheduler()
+        with self.assertRaises(ValueError):
+            PhaseBalance.from_env(s, {"VLLM_FLASH_PP_BALANCE": "1"})
+        self.assertTrue(self.mtp_helper(s).mtp_pairs)
+        for field, value in [("num_spec_tokens", 2), ("max_num_running_reqs", 5)]:
+            changed = self.mtp_scheduler()
+            setattr(changed, field, value)
+            with self.assertRaises(ValueError):
+                self.mtp_helper(changed)
+        for field, value in [
+            ("tensor_parallel_size", 4),
+            ("enable_expert_parallel", True),
+        ]:
+            changed = self.mtp_scheduler()
+            setattr(changed.parallel_config, field, value)
+            with self.assertRaises(ValueError):
+                self.mtp_helper(changed)
+
+    def test_mtp_cold_admission_forms_two_pairs_without_delaying_c1(self):
+        s = self.mtp_scheduler()
+        h = self.mtp_helper(s)
+        a, b, c, d = [fresh(key) for key in "abcd"]
+        selected = {}
+        for r in (a, b):
+            self.assertFalse(self.call(h, s, r, selected))
+            r.status.name = "RUNNING"
+            s.running.append(r)
+            selected[r.request_id] = r.num_prompt_tokens
+        self.assertTrue(self.call(h, s, c, selected))
+        for r in (a, b):
+            r.num_computed_tokens = 31
+            r.num_output_placeholders = 2
+            r.spec_token_ids = [-1]
+            r.next_decode_eligible_step = 3
+        s.current_step = 2
+        selected = {}
+        for r in (c, d):
+            self.assertFalse(self.call(h, s, r, selected))
+            h.clear(r)
+            r.status.name = "RUNNING"
+            s.running.append(r)
+            selected[r.request_id] = r.num_prompt_tokens
+        self.assertEqual([r.next_decode_eligible_step for r in (a, b)], [3, 3])
+        self.assertEqual(h._deferred, {})
+
+    def test_mtp_staggered_singleton_join_defers_once_and_keeps_decode_cadence(self):
+        s = self.mtp_scheduler(step=4)
+        h = self.mtp_helper(s)
+        old = established(eligible=5)
+        old.spec_token_ids = [-1]
+        old.num_output_placeholders = 2
+        s.running = [old]
+        incoming = fresh()
+        self.assertTrue(self.call(h, s, incoming))
+        self.assertEqual(old.next_decode_eligible_step, 5)
+        self.assertFalse(self.call(h, s, incoming))
+        s.current_step = 5
+        self.assertFalse(self.call(h, s, incoming, {"old": 2}))
+        h.clear(incoming)
+        self.assertEqual(h._deferred, {})
+
+    def test_mtp_pair_pilot_bypasses_long_prefill_and_ambiguous_running_state(self):
+        for mutation in (
+            {"is_prefill_chunk": True},
+            {"spec_token_ids": [-1, -1]},
+            {"num_output_placeholders": 3},
+            {"num_preemptions": 1},
+        ):
+            s = self.mtp_scheduler(step=4)
+            old = established(eligible=5)
+            old.spec_token_ids = [-1]
+            vars(old).update(mutation)
+            s.running = [old]
+            self.assertFalse(self.call(self.mtp_helper(s), s, fresh()))
+        s = self.mtp_scheduler(step=4)
+        old = established(eligible=5)
+        old.spec_token_ids = [-1]
+        s.running = [old]
+        self.assertFalse(self.call(self.mtp_helper(s), s, fresh(length=513)))
+
     def call(self, h, s, r, selected=None, **kw):
         s.requests[r.request_id] = r
         for old in s.running:

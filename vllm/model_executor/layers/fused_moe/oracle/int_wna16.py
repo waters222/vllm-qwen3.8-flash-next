@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from enum import Enum
 from typing import Any
@@ -538,6 +539,28 @@ def _pad_w13_bias(bias: torch.Tensor, n: int, padded_n: int) -> torch.Tensor:
     return bias.reshape(e, 2 * padded_n).contiguous()
 
 
+def _flash_tp4_repack_one_expert_at_a_time(weight, n, padded_n, *, gate_up):
+    """Use native repacking without materializing a full padded expert bank."""
+    size_k = weight.shape[1] * 8 if gate_up else padded_n
+    size_n = 2 * padded_n if gate_up else weight.shape[2]
+    output = torch.empty(
+        (weight.shape[0], size_k // 16, size_n * 2),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+    for expert in range(weight.shape[0]):
+        shard = weight[expert : expert + 1]
+        padded = (
+            _pad_w13_shard_cols(shard, n, padded_n)
+            if gate_up
+            else _pad_rows(shard, padded_n // 8)
+        )
+        output[expert : expert + 1].copy_(
+            ops.gptq_marlin_moe_repack(padded, size_k, size_n, 4)
+        )
+    return output
+
+
 def _process_weights_marlin(
     layer: torch.nn.Module,
     input_dtype: torch.dtype | None,
@@ -602,9 +625,37 @@ def _process_weights_marlin(
     # GPTQ packs along K: w13's N is in the (shard) columns, w2's N in the rows.
     N = layer.intermediate_size_per_partition
     padded_N = marlin_moe_padded_intermediate(N, group_size)
+    chunked_flag = os.environ.get("VLLM_FLASH_TP4_CHUNKED_REPACK", "0")
+    if chunked_flag not in ("0", "1"):
+        raise ValueError("VLLM_FLASH_TP4_CHUNKED_REPACK must be 0 or 1")
+    chunked = chunked_flag == "1"
+    if chunked:
+        config = layer.moe_config
+        if not (
+            config.tp_size == 4
+            and config.ep_size == config.dp_size == 1
+            and N == 160
+            and padded_N == 192
+            and group_size == 32
+            and num_bits == 4
+            and pack_factor == 8
+            and not is_a_8bit
+            and tuple(w13_qweight.shape) == (512, 320, 320)
+            and tuple(w2_qweight.shape) == (512, 20, 2560)
+            and w13_qweight.dtype == w2_qweight.dtype == torch.int32
+            and w13_qweight.is_cuda
+            and w2_qweight.device == w13_qweight.device
+            and w13_qweight.is_contiguous()
+            and w2_qweight.is_contiguous()
+        ):
+            raise ValueError(
+                "Chunked repack pilot requires TP4/noEP Qwen4Exp "
+                "INT4 group32 expert shards"
+            )
     if padded_N != N:
-        marlin_w13_qweight = _pad_w13_shard_cols(marlin_w13_qweight, N, padded_N)
-        marlin_w2_qweight = _pad_rows(marlin_w2_qweight, padded_N // pack_factor)
+        if not chunked:
+            marlin_w13_qweight = _pad_w13_shard_cols(marlin_w13_qweight, N, padded_N)
+            marlin_w2_qweight = _pad_rows(marlin_w2_qweight, padded_N // pack_factor)
         marlin_w13_scales = _pad_w13_shard_cols(marlin_w13_scales, N, padded_N)
         if group_size > 0:
             marlin_w2_scales = _pad_rows(marlin_w2_scales, padded_N // group_size)
@@ -618,20 +669,30 @@ def _process_weights_marlin(
             w13_bias = _pad_w13_bias(w13_bias, N, padded_N)
 
     # --- Repack weights ---
-    marlin_w13_qweight = ops.gptq_marlin_moe_repack(
-        marlin_w13_qweight,
-        marlin_w13_qweight.shape[1] * pack_factor,
-        marlin_w13_qweight.shape[2],
-        num_bits,
-        is_a_8bit=is_a_8bit,
-    )
-    marlin_w2_qweight = ops.gptq_marlin_moe_repack(
-        marlin_w2_qweight,
-        marlin_w2_qweight.shape[1] * pack_factor,
-        marlin_w2_qweight.shape[2],
-        num_bits,
-        is_a_8bit=is_a_8bit,
-    )
+    repack = ops.gptq_marlin_moe_repack
+    if chunked:
+        marlin_w13_qweight = _flash_tp4_repack_one_expert_at_a_time(
+            marlin_w13_qweight, N, padded_N, gate_up=True
+        )
+        marlin_w2_qweight = _flash_tp4_repack_one_expert_at_a_time(
+            marlin_w2_qweight, N, padded_N, gate_up=False
+        )
+        logger.info_once("Using experimental expert-wise TP4 Marlin padding/repack")
+    else:
+        marlin_w13_qweight = repack(
+            marlin_w13_qweight,
+            marlin_w13_qweight.shape[1] * pack_factor,
+            marlin_w13_qweight.shape[2],
+            num_bits,
+            is_a_8bit=is_a_8bit,
+        )
+        marlin_w2_qweight = repack(
+            marlin_w2_qweight,
+            marlin_w2_qweight.shape[1] * pack_factor,
+            marlin_w2_qweight.shape[2],
+            num_bits,
+            is_a_8bit=is_a_8bit,
+        )
 
     # --- Permute scales ---
     marlin_w13_scales = marlin_moe_permute_scales(

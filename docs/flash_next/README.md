@@ -9,6 +9,9 @@ Also under validation: [opt-in QSA page cap](qsa-page-cap.md).
 The experimental MTP branch also preserves [draft-only INT8 conversion and
 MTP-aware scheduling diagnostics](mtp-int8-experts.md). These are not a serving
 promotion; the original snapshot branch/tag remain recovery points.
+Further experimental work: [MTP1 phase-pair admission](mtp-pairs.md), whose
+broader concurrency screen remains mixed, and [lower-peak TP4 repacking](tp4-chunked-repack.md),
+which passed a real-layer bitwise/memory probe but is not yet full-model qualified.
 Revised source files are tracked separately from the original image hashes;
 the byte-for-byte preservation statements below describe the snapshot.
 

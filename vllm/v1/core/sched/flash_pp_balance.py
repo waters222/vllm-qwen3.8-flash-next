@@ -3,6 +3,7 @@
 Completing chunks of already-running prefills are conservatively ambiguous and
 bypass balancing. Only fresh same-loop prefills and established decodes count.
 This deliberately does not implement running/chunked-prefill phase correction.
+The separate MTP1 opt-in fills two-request cohorts before using the other phase.
 """
 import os
 
@@ -16,6 +17,17 @@ class PhaseBalance:
             raise ValueError('VLLM_FLASH_PP_BALANCE must be 0 or 1')
         if flag=='0':return None
         s=scheduler
+        pairs = env.get('VLLM_FLASH_PP_MTP_PAIRS', '0')
+        if pairs not in ('0', '1'):
+            raise ValueError('VLLM_FLASH_PP_MTP_PAIRS must be 0 or 1')
+        spec = s.vllm_config.speculative_config
+        spec_ok = spec is None and s.num_spec_tokens == 0
+        if pairs == '1':
+            spec_ok = (spec is not None and spec.method == 'mtp'
+                       and spec.num_speculative_tokens == s.num_spec_tokens == 1
+                       and s.parallel_config.tensor_parallel_size == 2
+                       and not s.parallel_config.enable_expert_parallel
+                       and 1 <= s.max_num_running_reqs <= 4)
         if not (
             type(s).__module__=='vllm.v1.core.sched.async_scheduler'
             and type(s).__name__=='AsyncScheduler'
@@ -23,19 +35,21 @@ class PhaseBalance:
             and s.parallel_config.pipeline_parallel_size==2
             and s.parallel_config.data_parallel_size==1
             and s.vllm_config.model_config.hf_config.model_type=='qwen4_exp'
-            and s.vllm_config.speculative_config is None and s.num_spec_tokens==0
+            and spec_ok
             and s.num_sampled_tokens_per_step==1
             and s.lora_config is None and not s.cache_config.enable_prefix_caching
             and s.connector is None and s.ec_connector is None
             and not s.is_encoder_decoder and not s.is_mm_encoder_only
             and s.max_num_encoder_input_tokens==0
         ):
-            raise ValueError('Phase balance requires standard Qwen4Exp V2 async PP2 DP1 text-only serving without speculation, LoRA, prefix cache or connectors')
-        return cls()
+            raise ValueError('Phase admission requires standard Qwen4Exp V2 async PP2 DP1 text-only serving; MTP needs the explicit TP2/noEP MTP1 pair pilot with at most four requests; LoRA, prefix cache and connectors are unsupported')
+        return cls(mtp_pairs=pairs == '1')
 
-    def __init__(self):
+    def __init__(self, mtp_pairs=False):
         # Internal identifiers only; values are numeric identities/steps, never references.
         self._deferred={}
+        self.mtp_pairs = mtp_pairs
+        self.decode_width = 2 if mtp_pairs else 1
 
     def clear(self, request):
         marker=self._deferred.get(request.request_id)
@@ -50,8 +64,7 @@ class PhaseBalance:
     def _status(request, name):
         return getattr(request.status,'name',None)==name
 
-    @staticmethod
-    def _plain(request):
+    def _plain(self, request):
         return (
             request.num_preemptions==0 and request.num_stale_output_tokens==0
             and not request.resumable and not request.use_structured_output
@@ -60,12 +73,15 @@ class PhaseBalance:
             and request.lora_request is None and request.prompt_token_ids is not None
             and getattr(request,'prompt_embeds',None) is None
             and getattr(request,'inputs_embeds',None) is None
-            and not request.spec_token_ids
+            and (not request.spec_token_ids or
+                 (self.mtp_pairs and len(request.spec_token_ids) == 1
+                  and type(request.spec_token_ids[0]) is int
+                  and request.spec_token_ids[0] >= -1))
         )
 
-    @classmethod
-    def _fresh(cls, request):
-        return (cls._plain(request) and request.num_computed_tokens==0
+    def _fresh(self, request):
+        return (self._plain(request) and not request.spec_token_ids
+                and request.num_computed_tokens==0
                 and request.num_output_tokens==0 and request.num_output_placeholders==0
                 and request.next_decode_eligible_step==0
                 and 1<=request.num_prompt_tokens<=512
@@ -103,18 +119,25 @@ class PhaseBalance:
                 if self._fresh(running):
                     if n!=running.num_prompt_tokens:return False
                     # Includes first successful admission in the current waiting loop.
-                elif (n!=1 or running.is_prefill_chunk or computed<running.num_prompt_tokens
-                      or not 0<=running.num_output_placeholders<=1):
+                elif (n!=self.decode_width or running.is_prefill_chunk or computed<running.num_prompt_tokens
+                      or not 0<=running.num_output_placeholders<=self.decode_width):
                     return False
                 occupancy[(step+2)%2]+=1
             else:
                 if (running.is_prefill_chunk or computed<running.num_prompt_tokens
-                        or not 0<=running.num_output_placeholders<=1):return False
+                        or not 0<=running.num_output_placeholders<=self.decode_width):return False
                 eligible=running.next_decode_eligible_step
                 if not step<eligible<=step+2:return False # Overdue/unscheduled is ambiguous.
                 occupancy[eligible%2]+=1
         phase=(step+2)%2
-        if occupancy[phase]>occupancy[1-phase]:
+        if self.mtp_pairs:
+            # Fill a singleton cohort, then open the other phase after a pair.
+            # Never move an established request or defer a new request twice.
+            defer = ((occupancy[phase] == 0 and occupancy[1-phase] == 1)
+                     or (occupancy[phase] >= 2 and occupancy[1-phase] < 2))
+        else:
+            defer = occupancy[phase] > occupancy[1-phase]
+        if defer:
             self._deferred[request.request_id]=(id(request),step)
             return True
         return False

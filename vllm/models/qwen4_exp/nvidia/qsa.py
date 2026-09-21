@@ -395,16 +395,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 1, int(getattr(config, "mtp_num_hidden_layers", 1) or 1)
             )
         if self._qsa_kv_offload:
-            if tp_size not in (1, 2):
-                raise NotImplementedError("QSA host KV validated layout requires TP=1 or TP=2")
+            tp4_pilot = os.environ.get("VLLM_FLASH_QSA_TP4", "0") == "1"
+            if tp_size not in (1, 2) and not (tp4_pilot and tp_size == 4):
+                raise NotImplementedError("QSA host KV TP4 requires VLLM_FLASH_QSA_TP4=1")
             if vllm_config.parallel_config.data_parallel_size != 1:
                 raise NotImplementedError("QSA host KV budget requires DP=1")
-            if self.total_num_kv_heads % tp_size:
+            if self.total_num_kv_heads % tp_size and not (
+                tp4_pilot and tp_size == 4 and self.total_num_kv_heads == 2
+            ):
                 raise NotImplementedError("QSA host KV requires evenly sharded KV heads")
-            if self.num_kv_heads * tp_size != self.total_num_kv_heads:
+            replicas = max(1, tp_size // self.total_num_kv_heads)
+            if self.num_kv_heads * tp_size != self.total_num_kv_heads * replicas:
                 raise RuntimeError("QSA host KV local head count disagrees with TP layout")
-            # Each rank owns only its local heads. Across both PP stages,
-            # count every TP shard of every layer against the host budget.
+            # Count all physical pools, including replicated KV heads at TP4.
             self._qsa_offload_tp_size = tp_size
             if self.num_heads % self.num_kv_heads:
                 raise RuntimeError("QSA host KV query/KV head ratio is invalid")

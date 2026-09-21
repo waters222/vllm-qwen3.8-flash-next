@@ -21,7 +21,7 @@ class PreservationTests(unittest.TestCase):
         manifest = json.loads(
             (ROOT / "docs/flash_next/source_manifest.json").read_text()
         )
-        self.assertEqual(len(manifest["engine_sources"]), 41)
+        self.assertEqual(len(manifest["engine_sources"]), 42)
         revisions = manifest.get("post_snapshot_sources", {})
         self.assertLessEqual(revisions.keys(), manifest["engine_sources"].keys())
         for name, expected in manifest["engine_sources"].items():
