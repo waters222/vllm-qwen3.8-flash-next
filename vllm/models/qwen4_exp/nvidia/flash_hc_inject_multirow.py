@@ -43,3 +43,41 @@ def candidate(x, weight, block_k=128):
     _finish[(rows,)](partial, output, rows, splits, triton.next_power_of_2(splits),
                       num_warps=4, enable_fp_fusion=False)
     return output
+
+
+@triton.jit
+def _partial_rows(X, W, P, BK: tl.constexpr, SPLITS: tl.constexpr):
+    split, row = tl.program_id(0), tl.program_id(1)
+    ks = split * BK + tl.arange(0, BK)
+    ns = tl.arange(0, 4)
+    weight = tl.load(
+        W + ns[:, None] * 10240 + ks[None, :], ks[None, :] < 10240, 0
+    ).to(tl.float32)
+    x = tl.load(X + row * 10240 + ks, ks < 10240, 0).to(tl.float32)
+    value = tl.sum(weight * x[None, :], axis=1)
+    tl.store(P + (row * 4 + ns) * SPLITS + split, value)
+
+
+def candidate_speculative(x, weight):
+    """Cover the native M5--16 skinny-GEMM cliff without changing M1--4."""
+    if not (
+        x.ndim == 2
+        and 5 <= x.shape[0] <= 16
+        and x.shape[1] == 10240
+        and tuple(weight.shape) == (4, 10240)
+        and x.dtype == weight.dtype == torch.bfloat16
+        and x.is_cuda and weight.is_cuda and x.device == weight.device
+        and x.is_contiguous() and weight.is_contiguous()
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    ):
+        raise ValueError('Require SM86 contiguous BF16 HC injection M5--16, N4/K10240')
+    rows, splits = x.shape[0], 80
+    partial = torch.empty((rows, 4, splits), device=x.device, dtype=torch.float32)
+    output = torch.empty((rows, 4), device=x.device, dtype=torch.bfloat16)
+    _partial_rows[(splits, rows)](
+        x, weight, partial, 128, splits, num_warps=4, enable_fp_fusion=False
+    )
+    _finish[(rows,)](
+        partial, output, rows, splits, 128, num_warps=4, enable_fp_fusion=False
+    )
+    return output

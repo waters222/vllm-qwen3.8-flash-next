@@ -12,10 +12,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from . import flash_hc_inject_multirow as kernel
 
 _ENABLED = os.environ.get('VLLM_FLASH_HC_INJECT_SM86', '0') == '1'
+_MTP_ENABLED = os.environ.get('VLLM_FLASH_HC_INJECT_MTP', '0') == '1'
 
 
 def eligible(x, weight):
-    return (x.ndim == 2 and tuple(x.shape) in ((1, 10240), (2, 10240), (4, 10240))
+    return (x.ndim == 2
+            and (tuple(x.shape) in ((1, 10240), (2, 10240), (4, 10240))
+                 or (_MTP_ENABLED and 5 <= x.shape[0] <= 16 and x.shape[1] == 10240))
             and tuple(weight.shape) == (4, 10240)
             and x.dtype == weight.dtype == torch.bfloat16
             and x.is_cuda and weight.is_cuda and x.device == weight.device
@@ -26,6 +29,8 @@ def eligible(x, weight):
 def _injection(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if not _ENABLED or envs.VLLM_BATCH_INVARIANT:
         raise RuntimeError('HC injection requires its opt-in and ordinary execution mode')
+    if _MTP_ENABLED and x.ndim == 2 and 5 <= x.shape[0] <= 16:
+        return kernel.candidate_speculative(x, weight)
     return kernel.candidate(x, weight)
 
 
