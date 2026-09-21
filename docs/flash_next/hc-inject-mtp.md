@@ -176,3 +176,75 @@ The matched no-MTP control uses the same750MB cache, source payloads, host
 KV allowance and runtime configuration, excluding speculation/Q8 flags and
 the graph sizes required by drafting. Its comparison remains pending. No
 production setting has changed.
+
+## Matched no-MTP comparison
+
+The same750MB-cache no-MTP control completed the same36 timing batches,
+sequential fixture and58 concurrent behavior checks. The full five-arm audit
+passes: identical benchmark client/source pins and configured memory budgets,
+zero preemptions, expected output overlap, complete streamed token counts and
+settled speculative counters. No-MTP has no speculative counter increments.
+The differences are draft configuration/Q8 flags and required graph sizes.
+
+|Class|C1 decode|C2 aggregate|C3 aggregate|C4 aggregate|
+|---|---:|---:|---:|---:|
+|Math|87.33|137.28|194.13|243.67|
+|Code|88.12|137.59|194.42|245.25|
+|Prose|88.66|137.57|194.38|244.77|
+
+The selection score is the geometric mean of throughput ratios across equally
+weighted math/code/prose and C2/C3/C4. C1 decode is reported separately, not
+mixed with concurrent aggregate throughput.
+
+|Draft depth|C2--4 score gain|Worst tested concurrent gain|C1 decode score gain|
+|---|---:|---:|---:|
+|1|29.53%|20.43%|0.39%|
+|2|44.75%|21.29%|41.97%|
+|3|49.50%|14.84%|57.83%|
+|4|47.15%|3.76%|65.27%|
+
+Depth3 is the observed balanced-score leader. Relative to no-MTP, it gains
+77.05/63.04/52.84% on math,74.97/74.39/65.65% on code, and
+18.22/23.25/14.84% on prose at C2/3/4. Depth2 has a stronger weakest-case
+gain in this small workload set and can be preferable for prose-heavy traffic;
+depth4 slightly favors concurrent code. The2--4 score margins are small and
+not statistical confidence bounds. Keep all slow C1 samples and their
+unresolved timing variation; do not claim a universal best depth.
+
+The control also passed eight synthetic padded-math C1 context measurements,
+two each at2K/8K/16K/32K with256 output tokens and zero preemptions. Median
+input-token/TTFT rates are4063/4075/4060/3996tok/s; decode medians are
+77.80/77.49/77.30/77.49tok/s. This prefill proxy includes API/first-token
+overhead and is not isolated GPU prefill time. No240K or concurrent long-context
+performance claim is made. Raw comparison/audit evidence remains in the operations
+repository at `tp4-current/hc-depth-final-comparison.json` and `hc-control/`.
+
+## Selected depth3 context confirmation and recommendation
+
+An intentional restart of the retained depth3 trial preserved its exact runtime
+configuration and ten source payloads. The fresh sequential fixture matched
+all12 historical outputs. Two C1 repeats at each exact context length passed
+token/counter audits with zero preemptions; both client scripts match the
+control. Original throughput samples were not replaced.
+
+|Context|No-MTP prefill proxy|MTP3 prefill proxy|No-MTP decode|MTP3 decode|
+|---|---:|---:|---:|---:|
+|2K|4063|3951|77.80|101.34|
+|8K|4075|3905|77.49|116.21|
+|16K|4060|3881|77.30|123.81|
+|32K|3996|3806|77.49|124.26|
+
+All rates are tok/s; prefill proxy means input tokens divided by TTFT. Decode
+uses256 output tokens after synthetic math-context padding. Depth3 acceptance
+is80.35/71.34/80.44/80.67% at2K/8K/16K/32K. Keep the2K decode samples
+125.06/77.63 rather than claiming a uniform latency benefit. Its timing
+variability remains unresolved. Prefill is modestly slower with MTP here.
+
+Recommend **MTP=3 with Q8 draft-expert weights and BF16 activations** for this
+tested TP4/PP1/noEP workload mix. This is a balanced empirical choice, not a
+statistically unique optimum or whole-head W8A8 qualification. The target AWQ
+weights are unchanged. Depth2 is a reasonable prose-heavy alternative; depth4
+slightly favors code but has a weaker worst-case result. All five arms passed
+the full180-batch timing and290-answer bounded concurrent audit. The selected
+experimental trial and unchanged serving peer are healthy/idle after testing.
+No production promotion or clean consolidated-image qualification is implied.

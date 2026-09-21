@@ -15,8 +15,8 @@ which passed a real-layer bitwise/memory probe but is not yet full-model qualifi
 The subsequent full Marlin load still failed VRAM allocation. A
 [native unpadded K32 specialization](marlin-k32.md) now has passing real-weight
 small-row and prefill/graph screens, full-model TP4 no-MTP measurements, and
-a completed TP4 Q8 MTP3 short-prompt concurrency screen. MTP concurrent gains
-remain workload-dependent; profiling and depth selection are still in progress.
+a completed TP4 Q8 MTP1--4 short-prompt concurrency comparison. MTP concurrent
+gains remain workload-dependent; the matched-control selection is recorded below.
 It is default-off and is not part of the historical serving image.
 The [larger-row HC injection extension](hc-inject-mtp.md) has now passed
 installed GPU/compile checks and repeated TP4 Q8 MTP1--4 full-model screens.
@@ -25,8 +25,13 @@ prose C1 was slower. MTP4 slightly leads MTP3 for concurrent code but loses
 about10% for prose C3/C4. Intermittent C1 slowdowns also occur in math.
 MTP2 favors prose but is slightly behind MTP3 on the equally weighted
 concurrent mix. MTP1 also passed the matrix and58 concurrent checks but ranks
-13.4% below MTP3 on that mix. A matched-cache no-MTP control, balanced
-selection and the C1 timing issue remain open.
+13.4% below MTP3 on that mix. Against the completed matched-cache no-MTP
+control, recommend MTP=3 with Q8 draft-expert weights/BF16 activations for
+this tested mix:49.50% equal-weight aggregate gain across math/code/prose
+C2--4. Depth2/4 gain44.75%/47.15%; small margins are not statistical
+separation. All five arms passed bounded concurrent behavior checks; selected
+depth3 also passed C1 context checks through32K. Intermittent C1 timing
+variation remains unresolved; this is not a production promotion or240K test.
 Revised source files are tracked separately from the original image hashes;
 the byte-for-byte preservation statements below describe the snapshot.
 
