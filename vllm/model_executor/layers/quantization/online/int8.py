@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import TYPE_CHECKING
+import os
 
 import torch
 from torch.nn import Module
@@ -58,6 +59,11 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
         layer._already_called_process_weights_after_loading = True
 
     def _quantize_weights(self, layer: Module) -> None:
+        if os.environ.get("VLLM_FLASH_MTP_INT8_LOW_PEAK", "0") == "1":
+            if getattr(layer, "layer_name", None) != "mtp.layers.48.mlp.experts":
+                raise ValueError("Low-peak INT8 pilot only supports the MTP expert layer")
+            self._quantize_weights_low_peak(layer)
+            return
         vmax = torch.iinfo(torch.int8).max
 
         w13 = torch.empty_like(layer.w13_weight, dtype=torch.int8)
@@ -96,6 +102,40 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w2_weight", w2)
         replace_parameter(layer, "w13_scale", w13_scale)
+        replace_parameter(layer, "w2_scale", w2_scale)
+
+    def _quantize_weights_low_peak(self, layer: Module) -> None:
+        from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+        if get_layerwise_info(layer).kernel_tensors is not None:
+            raise ValueError("Low-peak INT8 pilot does not support weight reload")
+
+        def convert(weight, amax=None):
+            quantized = torch.empty_like(weight, dtype=torch.int8)
+            scales_out = torch.zeros(
+                layer.num_experts, weight.shape[1], device=weight.device,
+                dtype=torch.float32,
+            )
+            for expert in range(layer.local_num_experts):
+                w = weight[expert, :, :]
+                scales = (w.abs().amax(dim=1) if amax is None else amax[expert]) / 127
+                q = w.div(scales.unsqueeze(1)).round().clamp(-127, 127)
+                quantized[expert, :, :] = q.to(torch.int8)
+                scales_out[expert, :] = scales
+            return quantized, scales_out
+
+        w13, w13_scale = convert(layer.w13_weight)
+        # Loader bound arguments retain the old Parameter object until this
+        # method returns. Rebind its data before replacing it to release BF16
+        # storage even while those references remain alive (initial load only).
+        layer.w13_weight.data = w13
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w13_scale", w13_scale)
+        w2_amax = weight_amax(layer.w2_weight, dim=-1)
+        w2_amax = amax_for_moe_weight_quant(w2_amax, self.moe.tp_size)
+        w2, w2_scale = convert(layer.w2_weight, w2_amax)
+        layer.w2_weight.data = w2
+        replace_parameter(layer, "w2_weight", w2)
         replace_parameter(layer, "w2_scale", w2_scale)
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:

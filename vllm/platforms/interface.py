@@ -107,6 +107,13 @@ def _qsa_offload_block_size(vllm_config: "VllmConfig", mamba_page_size: int):
         )
     per_token = layers_per_rank * _qsa_offload_bytes_per_token_per_layer(vllm_config)
     block_size = (mamba_page_size // per_token) // 16 * 16
+    # Smaller attention pages can avoid a pinned-host allocator size-class jump
+    # when the shared GPU pool grows to hold speculative recurrent states.
+    cap = int(os.environ.get("VLLM_QSA_OFFLOAD_BLOCK_SIZE_CAP", "0"))
+    if cap:
+        if cap < 16 or cap % 16 or cap > block_size:
+            raise ValueError("QSA offload page cap must be a multiple of 16 <= auto size")
+        block_size = cap
     return block_size if block_size >= 16 else None
 
 

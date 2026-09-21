@@ -4,6 +4,14 @@ This branch preserves the engine source used by a qualified four-GPU
 Qwen3.8-Flash-Next evaluation on 2026-09-20. It is **not** an upstream vLLM
 release, a generic deployment preset, or a newly rebuilt/validated image.
 
+Post-snapshot change: [MTP padding correctness fix](mtp-padding-fix.md).
+Also under validation: [opt-in QSA page cap](qsa-page-cap.md).
+The experimental MTP branch also preserves [draft-only INT8 conversion and
+MTP-aware scheduling diagnostics](mtp-int8-experts.md). These are not a serving
+promotion; the original snapshot branch/tag remain recovery points.
+Revised source files are tracked separately from the original image hashes;
+the byte-for-byte preservation statements below describe the snapshot.
+
 ## Provenance
 
 - Upstream base: `dc36fcce902a63eab06c1b93a5c4a5ee178a0c56`.

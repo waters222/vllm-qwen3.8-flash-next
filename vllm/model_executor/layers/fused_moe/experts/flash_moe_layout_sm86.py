@@ -45,6 +45,9 @@ def _maximum(a, b):
 def _align_small(IDS, SORTED, EXPERTS, TOTAL, T: tl.constexpr, INIT: tl.constexpr):
     positions = tl.arange(0, 64)
     ids = tl.load(IDS + positions, positions < T, 512).to(tl.int32)
+    # Normalize padding before packing: signed division/remainder of negative
+    # keys can otherwise produce expert 0 with negative token indices.
+    ids = tl.where((ids >= 0) & (ids < 512), ids, 512)
     keys = tl.sort(ids * 64 + positions, descending=False)
     experts = keys // 64
     tokens = keys % 64
@@ -109,25 +112,36 @@ def combine_eligible(x, out):
 
 
 @triton.jit
-def _combine10(X, Y, BLOCK: tl.constexpr):
+def _combine10(X, Y, IDS, USE_IDS: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(1)
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     acc = tl.full((BLOCK,), 0, tl.float32)
     for k in tl.static_range(10):
-        value = tl.load(X + (row * 10 + k) * 2560 + offsets, offsets < 2560, 0).to(tl.float32)
+        valid = offsets < 2560
+        if USE_IDS:
+            expert = tl.load(IDS + row * 10 + k)
+            valid = valid & (expert >= 0) & (expert < 512)
+        value = tl.load(X + (row * 10 + k) * 2560 + offsets, valid, 0).to(tl.float32)
         acc = acc + value
     tl.store(Y + row * 2560 + offsets, acc, offsets < 2560)
 
 
-def _combine(x: torch.Tensor, out: torch.Tensor) -> None:
+def _combine(x: torch.Tensor, out: torch.Tensor,
+             topk_ids: torch.Tensor | None = None) -> None:
     # Storage alias checking stays inside the opaque op, outside Dynamo tracing.
-    if combine_eligible(x, out):
-        _combine10[(20, x.shape[0])](x, out, 128, num_warps=4, enable_fp_fusion=False)
+    ids_supported = topk_ids is None or (
+        topk_ids.shape == x.shape[:2] and topk_ids.dtype == torch.int32
+        and topk_ids.device == x.device and topk_ids.is_contiguous())
+    if combine_eligible(x, out) and ids_supported:
+        _combine10[(20, x.shape[0])](x, out, topk_ids if topk_ids is not None else x,
+                                   topk_ids is not None, 128,
+                                   num_warps=4, enable_fp_fusion=False)
     else:
-        ops.moe_sum(x, out)
+        ops.moe_sum(x, out, topk_ids)
 
 
-def _combine_fake(x: torch.Tensor, out: torch.Tensor) -> None:
+def _combine_fake(x: torch.Tensor, out: torch.Tensor,
+                  topk_ids: torch.Tensor | None = None) -> None:
     return None
 
 
@@ -135,7 +149,7 @@ direct_register_custom_op(op_name='flash_moe_layout_combine_sm86', op_func=_comb
                           mutates_args=['out'], fake_impl=_combine_fake)
 
 
-def moe_sum(x, out):
+def moe_sum(x, out, topk_ids=None):
     if not _ENABLED:
-        return ops.moe_sum(x, out)
-    return torch.ops.vllm.flash_moe_layout_combine_sm86(x, out)
+        return ops.moe_sum(x, out, topk_ids)
+    return torch.ops.vllm.flash_moe_layout_combine_sm86(x, out, topk_ids)

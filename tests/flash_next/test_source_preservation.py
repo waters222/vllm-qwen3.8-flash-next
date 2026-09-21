@@ -17,15 +17,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class PreservationTests(unittest.TestCase):
-    def test_installed_engine_sources_are_preserved(self):
+    def test_engine_sources_match_snapshot_or_documented_revision(self):
         manifest = json.loads(
             (ROOT / "docs/flash_next/source_manifest.json").read_text()
         )
-        self.assertEqual(len(manifest["engine_sources"]), 40)
+        self.assertEqual(len(manifest["engine_sources"]), 41)
+        revisions = manifest.get("post_snapshot_sources", {})
+        self.assertLessEqual(revisions.keys(), manifest["engine_sources"].keys())
         for name, expected in manifest["engine_sources"].items():
             with self.subTest(source=name):
                 source = (ROOT / name).read_bytes()
-                self.assertEqual(hashlib.sha256(source).hexdigest(), expected)
+                self.assertEqual(
+                    hashlib.sha256(source).hexdigest(), revisions.get(name, expected)
+                )
                 ast.parse(source)
 
     def test_cuda_sources_reproduce_qualified_generator_outputs(self):

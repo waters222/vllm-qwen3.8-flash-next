@@ -24,6 +24,15 @@ class PhaseCapture:
         if start > 2**31 - 1:
             raise ValueError("VLLM_FLASH_PP_PHASE_START_STEP exceeds 2147483647")
         config = scheduler.vllm_config
+        allow_mtp = env.get("VLLM_FLASH_PP_PHASE_ALLOW_MTP", "0")
+        if allow_mtp not in ("0", "1"):
+            raise ValueError("VLLM_FLASH_PP_PHASE_ALLOW_MTP must be 0 or 1")
+        spec = config.speculative_config
+        spec_ok = spec is None and scheduler.num_spec_tokens == 0
+        if allow_mtp == "1":
+            spec_ok = (spec is not None and spec.method == "mtp"
+                       and 1 <= scheduler.num_spec_tokens <= 4
+                       and spec.num_speculative_tokens == scheduler.num_spec_tokens)
         if not (
             scheduler.use_v2_model_runner
             and scheduler.scheduler_config.async_scheduling
@@ -31,11 +40,10 @@ class PhaseCapture:
             and type(scheduler).__name__ == "AsyncScheduler"
             and scheduler.parallel_config.pipeline_parallel_size == 2
             and scheduler.parallel_config.data_parallel_size == 1
-            and config.speculative_config is None
-            and scheduler.num_spec_tokens == 0
+            and spec_ok
             and getattr(config.model_config.hf_config, "model_type", None) == "qwen4_exp"
         ):
-            raise ValueError("PP phase capture requires standard AsyncScheduler, V2, PP2, DP1, Qwen4Exp, no speculation")
+            raise ValueError("PP phase capture requires AsyncScheduler V2 PP2 DP1 Qwen4Exp; MTP needs explicit observer opt-in")
         def bounded(name, default, low, high):
             value=env.get(name,default)
             if not isinstance(value,str) or not value.isascii() or not value.isdecimal() or not low <= int(value) <= high:
@@ -109,6 +117,7 @@ class PhaseCapture:
                              eligible_before=int(request.next_decode_eligible_step)))
             references.append(request)
         record = dict(step=int(scheduler.current_step), phase=int(scheduler.current_step % 2),
+                      draft_depth=int(scheduler.num_spec_tokens),
                       scheduled_tokens=int(output.total_num_scheduled_tokens),
                       running_count=len(scheduler.running), waiting_count=len(scheduler.waiting),
                       skipped_waiting_count=len(scheduler.skipped_waiting),

@@ -14,6 +14,7 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
 """
 
 from collections.abc import Iterable
+import os
 
 import regex as re
 import torch
@@ -118,6 +119,31 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     return None
 
 
+def _draft_int8_targets(vllm_config, start_layer_idx, environ=None):
+    env = os.environ if environ is None else environ
+    flag = env.get("VLLM_FLASH_MTP_INT8_EXPERTS", "0")
+    if flag == "0":
+        return None
+    if flag != "1":
+        raise ValueError("VLLM_FLASH_MTP_INT8_EXPERTS must be 0 or 1")
+    config = vllm_config.model_config.hf_text_config
+    parallel = vllm_config.parallel_config
+    spec = vllm_config.speculative_config
+    if not (
+        config.model_type == "qwen4_exp_text"
+        and config.hidden_size == 2560
+        and config.num_hidden_layers == start_layer_idx == 48
+        and config.mtp_num_hidden_layers == 1
+        and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 2
+        and not parallel.enable_expert_parallel
+        and spec is not None
+        and spec.method == "mtp"
+        and 1 <= spec.num_speculative_tokens <= 4
+    ):
+        raise ValueError("Draft INT8 pilot requires Flash-Next TP2/PP2 MTP1--4")
+    return {"mtp.layers.48.mlp.experts": "int8_per_channel_weight_only"}
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -153,6 +179,23 @@ def _make_draft_vllm_config(
                 "quantized_layers",
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
+
+    int8_targets = _draft_int8_targets(vllm_config, mtp_start_layer_idx)
+    if int8_targets is not None:
+        from vllm.config.quantization import QuantizationConfigArgs
+        from vllm.model_executor.layers.quantization.online.base import (
+            OnlineQuantizationConfig,
+        )
+
+        if (
+            draft_quant_config is None
+            or draft_quant_config is vllm_config.quant_config
+            or draft_quant_config.online_quantization_config is not None
+        ):
+            raise ValueError("Draft INT8 requires a separate checkpoint quant config")
+        draft_quant_config.online_quantization_config = OnlineQuantizationConfig(
+            QuantizationConfigArgs(targets=int8_targets)
+        )
 
     draft_vllm_config = replace(
         vllm_config,
@@ -433,6 +476,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        self._int8_attested = os.environ.get("VLLM_FLASH_MTP_INT8_EXPERTS", "0") != "1"
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -446,6 +490,29 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        if not self._int8_attested:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Draft INT8 attestation must precede graph capture")
+            from vllm.logger import init_logger
+
+            for layer in self.model.layers:
+                experts = layer.mlp.experts.routed_experts
+                if type(experts.quant_method).__name__ != "Int8OnlineMoEMethod":
+                    raise RuntimeError("Draft INT8 expert method was not installed")
+                for name in ("w13_weight", "w2_weight"):
+                    weight = getattr(experts, name)
+                    if weight.dtype != torch.int8 or not weight.is_cuda:
+                        raise RuntimeError("Draft INT8 weight conversion did not complete")
+                for name in ("w13_scale", "w2_scale"):
+                    if not torch.isfinite(getattr(experts, name)).all().item():
+                        raise RuntimeError("Draft INT8 has non-finite scales")
+                init_logger(__name__).info(
+                    "Draft INT8 attested: w13=%s w2=%s, bytes=%d, backend=%s",
+                    tuple(experts.w13_weight.shape), tuple(experts.w2_weight.shape),
+                    experts.w13_weight.nbytes + experts.w2_weight.nbytes,
+                    experts.quant_method.int8_backend,
+                )
+            self._int8_attested = True
         return self.model(
             input_ids,
             positions,

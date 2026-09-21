@@ -872,13 +872,14 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         expert_map: torch.Tensor | None,
     ) -> None:
         if flash_moe_layout_sm86._ENABLED and expert_map is None and self._lora_context is None:
-            flash_moe_layout_sm86.moe_sum(input, output)
-        elif flash_moe_sum_c1._ENABLED and self._lora_context is None:
+            flash_moe_layout_sm86.moe_sum(input, output, topk_ids)
+        elif (flash_moe_sum_c1._ENABLED and expert_map is not None
+              and self._lora_context is None):
             flash_moe_sum_c1.moe_sum(input, output, topk_ids, expert_map)
         elif expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
         else:
-            ops.moe_sum(input, output)
+            ops.moe_sum(input, output, topk_ids)
 
 
 class BatchedMarlinExperts(MarlinExpertsBase):

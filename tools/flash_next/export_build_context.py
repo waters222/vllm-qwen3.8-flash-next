@@ -11,9 +11,13 @@ def export(root, output):
     if not output.is_dir() or any(output.iterdir()):
         raise ValueError("Build output must be an existing empty directory")
     manifest = json.loads((root / "docs/flash_next/source_manifest.json").read_text())
+    revisions = manifest.get("post_snapshot_sources", {})
+    if not revisions.keys() <= manifest["engine_sources"].keys():
+        raise ValueError("Source revisions cannot expand the engine allowlist")
     for name, expected in manifest["engine_sources"].items():
         source = root / name
-        if hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+        current_expected = revisions.get(name, expected)
+        if hashlib.sha256(source.read_bytes()).hexdigest() != current_expected:
             raise ValueError("Engine source differs: " + name)
         target = output / "engine" / name
         target.parent.mkdir(parents=True, exist_ok=True)

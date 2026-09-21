@@ -22,6 +22,56 @@ BLOCK_SIZES = [32, 128]
 set_random_seed(0)
 
 
+@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+def test_flash_layout_padding_alignment_and_combine(rows, monkeypatch):
+    """Padding must not become a negative token offset or read stale expert output."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 6):
+        pytest.skip("Flash layout specialization requires SM86")
+    from vllm.model_executor.layers.fused_moe.experts import flash_moe_layout_sm86
+
+    monkeypatch.setattr(flash_moe_layout_sm86, "_ENABLED", True)
+    ids = torch.full((rows, 10), -1, dtype=torch.int32, device="cuda")
+    values = torch.randn(rows, 10, 2560, dtype=torch.bfloat16, device="cuda")
+    output = torch.empty(rows, 2560, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        aligned = flash_moe_layout_sm86.moe_align_block_size(
+            ids, 8, 512, ignore_invalid_experts=True
+        )
+        flash_moe_layout_sm86.moe_sum(values, output, ids)
+        return aligned
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+
+    for pattern in ("empty", "mixed", "valid", "empty"):
+        ids.copy_(torch.arange(rows * 10, device="cuda").reshape(rows, 10) % 512)
+        if pattern == "empty":
+            ids.fill_(-1)
+        elif pattern == "mixed":
+            ids[:, ::2] = -1
+        values.normal_()
+        values.masked_fill_((ids < 0).unsqueeze(-1), float("nan"))
+        expected = torch.zeros_like(output, dtype=torch.float32)
+        for k in range(10):
+            expected += torch.where(
+                (ids[:, k] >= 0).unsqueeze(-1), values[:, k].float(), 0
+            )
+        native = moe_align_block_size(ids, 8, 512, ignore_invalid_experts=True)
+        for actual in (run(), captured):
+            if actual is captured:
+                graph.replay()
+            count = int(actual[2].item())
+            assert count == int(native[2].item())
+            assert torch.equal(actual[0][:count], native[0][:count])
+            assert torch.equal(actual[1][: count // 8], native[1][: count // 8])
+            assert bool((actual[0] >= 0).all())
+            torch.testing.assert_close(output, expected.bfloat16(), rtol=0, atol=0)
+
+
 def _group_tokens_by_expert(
     sorted_ids: torch.Tensor,
     expert_ids: torch.Tensor,
