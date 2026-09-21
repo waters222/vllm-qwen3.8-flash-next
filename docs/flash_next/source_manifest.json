@@ -3,17 +3,18 @@
   "validated_image_id": "sha256:0f75571247e58cfe09d11fe9c6d5dce6b7e2c7da9dfeb6c3e1a2607a7c7e5599",
   "post_snapshot_sources": {
     "vllm/models/qwen4_exp/nvidia/qsa.py": "6122fe2c0bad312a5bb7d244579d2d6d43d20e5fbd5c80fbebb1b484c6b9be90",
-    "vllm/model_executor/layers/fused_moe/oracle/int_wna16.py": "40526a4119193b3b0290486f0a233d3b21fad49c10b020ddbb555fd8636352d1",
+    "vllm/model_executor/layers/fused_moe/oracle/int_wna16.py": "dd2f772b1684c7c46d96876941153a57f3c4158833cd16095efff57de9ee7673",
     "vllm/v1/core/sched/flash_pp_balance.py": "55c7c3f42bc231f31bdbbc8bb085c3bb8b13197913183df6634f7f9afc43df83",
     "vllm/model_executor/layers/quantization/online/int8.py": "c851404d45569b592508ebe0c79a634e87ceda8e5a0cde6be11d36719f52dc41",
     "vllm/model_executor/layers/fused_moe/experts/flash_moe_layout_sm86.py": "2a336e127cdc855fd6d49efa2ee292f4f9ec5b58509fcd2c15cd64002d033c95",
-    "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": "63ffde8bfebd1d33028980e1e44af2ff910f8821a45497724eed6e5d83fd92ca",
+    "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": "8f95e58cdc75891054fbbe249e754cb257db60caaaf26d6a5ea02d1db52bf6e7",
     "vllm/platforms/interface.py": "2465e7a82013ad3606a95075dd2cdac436583b8a5c2665e2ff502b3964ac6d68",
     "vllm/models/qwen4_exp/nvidia/mtp.py": "1298b7f49f80818221bfe5394ff9001572a778f9d2146bb64358ef601ffc8300",
     "vllm/v1/core/sched/flash_pp_phase.py": "65ab6875b465f009316cdf83abca7a0ad8c7c80f4720175310860ad430cd836e"
   },
-  "post_snapshot_note": "MTP padding correction, opt-in QSA page cap, draft-only INT8 experts, MTP1 pair-admission pilot, and TP4 chunked repack/QSA layout pilot. These sources differ from the historical validated image. See the corresponding docs for qualification status. Original engine_sources hashes remain historical provenance; int_wna16.py adds its previously unchanged upstream/image baseline to the explicit allowlist.",
+  "post_snapshot_note": "MTP padding correction, opt-in QSA page cap, draft-only INT8 experts, MTP1 pair-admission pilot, TP4 chunked repack/QSA layout pilot, and default-off unpadded TP4 Marlin K32 integration. These sources differ from the historical validated image. K32 passed integrated one-layer checks, not full-model qualification. Original engine_sources hashes remain historical provenance except explicitly listed new experimental files; int_wna16.py adds its previously unchanged upstream/image baseline to the allowlist.",
   "engine_sources": {
+    "vllm/model_executor/layers/fused_moe/experts/flash_marlin_k32_sm86.py": "454145e0f989f01ff25843184608909207fac4a073a766f85481380483ccb372",
     "vllm/model_executor/layers/fused_moe/oracle/int_wna16.py": "cfffe8b8b290330be9d18ffa07aeecf296484395ff04df3147d99393e48b55c1",
     "vllm/model_executor/layers/quantization/online/int8.py": "cce5a51fa10cd14c1c790ee7dbb41b664f59af807498297cd6ebb5734af7e38e",
     "vllm/model_executor/layers/fused_moe/experts/flash_marlin_down_schedule_sm86.py": "dae7c9ca77111089a0836e17b7ea0eb9b007880bc04c7db4f16aa27ab7f3d56b",
@@ -58,6 +59,9 @@
     "vllm/v1/worker/gpu/attn_utils.py": "a959af22d727b20ac0a300ef96ccbe193dae24fbbf5bca174c2937ab242f8667"
   },
   "unchanged_upstream_python": 2458,
+  "new_experimental_sources_not_in_validated_image": [
+    "vllm/model_executor/layers/fused_moe/experts/flash_marlin_k32_sm86.py"
+  ],
   "excluded_generated_or_bundled_python": 202,
   "scope": "Exact installed changed/new Python engine sources. Generated version and bundled build dependencies are excluded. This is source preservation, not clean-build GPU qualification."
 }

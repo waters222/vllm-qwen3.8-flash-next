@@ -33,7 +33,8 @@ def export(root, output):
         target = output / "csrc" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
-    for name in ("build_flash_marlin_schedule.py", "build_flash_marlin_pipeline.py"):
+    for name in ("build_flash_marlin_schedule.py", "build_flash_marlin_pipeline.py",
+                 "build_flash_marlin_k32.py"):
         target = output / "builder" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / "tools/flash_next" / name, target)

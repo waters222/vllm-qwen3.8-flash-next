@@ -625,6 +625,22 @@ def _process_weights_marlin(
     # GPTQ packs along K: w13's N is in the (shard) columns, w2's N in the rows.
     N = layer.intermediate_size_per_partition
     padded_N = marlin_moe_padded_intermediate(N, group_size)
+    k32_flag = os.environ.get("VLLM_FLASH_TP4_MARLIN_K32", "0")
+    if k32_flag not in ("0", "1"):
+        raise ValueError("VLLM_FLASH_TP4_MARLIN_K32 must be 0 or 1")
+    if k32_flag == "1":
+        from vllm.model_executor.layers.fused_moe.experts import flash_marlin_k32_sm86
+
+        padded_N = flash_marlin_k32_sm86.prepare_unpadded(
+            layer,
+            input_dtype,
+            num_bits,
+            pack_factor,
+            group_size,
+            w13_qweight,
+            w2_qweight,
+        )
+        logger.info_once("Using experimental unpadded TP4 Marlin K32 expert layout")
     chunked_flag = os.environ.get("VLLM_FLASH_TP4_CHUNKED_REPACK", "0")
     if chunked_flag not in ("0", "1"):
         raise ValueError("VLLM_FLASH_TP4_CHUNKED_REPACK must be 0 or 1")

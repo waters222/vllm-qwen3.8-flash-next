@@ -9,6 +9,7 @@ import torch
 
 from . import flash_moe_layout_sm86
 from . import flash_marlin_down_schedule_sm86
+from . import flash_marlin_k32_sm86
 from . import flash_moe_sum_c1
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -198,6 +199,8 @@ def _fused_marlin_moe(
 
     down_gemm = (flash_marlin_down_schedule_sm86.gemm
                  if use_whole_tile_down else ops.moe_wna16_marlin_gemm)
+    if flash_marlin_k32_sm86._ENABLED and N == 160:
+        down_gemm = flash_marlin_k32_sm86.gemm
     output = down_gemm(
         intermediate_cache2,
         output,

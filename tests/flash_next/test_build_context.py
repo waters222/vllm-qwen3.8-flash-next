@@ -13,9 +13,9 @@ class BuildContextTests(unittest.TestCase):
     def test_context_excludes_git_credentials_weights_and_binaries(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            self.assertEqual(export(ROOT, output), 42)
+            self.assertEqual(export(ROOT, output), 43)
             files = [p.relative_to(output) for p in output.rglob("*") if p.is_file()]
-            self.assertEqual(len(files), 54)
+            self.assertEqual(len(files), 56)
             self.assertTrue(
                 all(
                     p.parts[0] in {"engine", "csrc", "builder", "Dockerfile"}

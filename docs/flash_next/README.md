@@ -12,6 +12,10 @@ promotion; the original snapshot branch/tag remain recovery points.
 Further experimental work: [MTP1 phase-pair admission](mtp-pairs.md), whose
 broader concurrency screen remains mixed, and [lower-peak TP4 repacking](tp4-chunked-repack.md),
 which passed a real-layer bitwise/memory probe but is not yet full-model qualified.
+The subsequent full Marlin load still failed VRAM allocation. A
+[native unpadded K32 specialization](marlin-k32.md) now has passing real-weight
+small-row and prefill/graph screens; guarded integration is being validated.
+It is default-off and is not part of the historical serving image.
 Revised source files are tracked separately from the original image hashes;
 the byte-for-byte preservation statements below describe the snapshot.
 
