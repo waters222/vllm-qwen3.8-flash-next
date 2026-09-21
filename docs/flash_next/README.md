@@ -19,11 +19,13 @@ a completed TP4 Q8 MTP3 short-prompt concurrency screen. MTP concurrent gains
 remain workload-dependent; profiling and depth selection are still in progress.
 It is default-off and is not part of the historical serving image.
 The [larger-row HC injection extension](hc-inject-mtp.md) has now passed
-installed GPU/compile checks and repeated TP4 Q8 MTP3/MTP4 full-model screens.
+installed GPU/compile checks and repeated TP4 Q8 MTP2/MTP3/MTP4 full-model screens.
 Concurrent throughput improved22.9--36.7% versus the same-cache MTP3 baseline;
 prose C1 was slower. MTP4 slightly leads MTP3 for concurrent code but loses
 about10% for prose C3/C4. Intermittent C1 slowdowns also occur in math.
-Depth1/2 comparison, balanced selection and the C1 timing issue remain open.
+MTP2 favors prose but is slightly behind MTP3 on the equally weighted
+concurrent mix. Depth1, a matched-cache control, balanced selection and the
+C1 timing issue remain open.
 Revised source files are tracked separately from the original image hashes;
 the byte-for-byte preservation statements below describe the snapshot.
 

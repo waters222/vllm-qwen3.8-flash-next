@@ -115,3 +115,35 @@ The intermittent slowdown is not specific to prose. Client intervals cannot
 separate GPU work, scheduling or transport; its cause remains unresolved.
 Artifacts are under the operations repository's `tp4-current/q8-mtp4-hc/`.
 No production promotion or final balanced-depth selection has been made.
+
+## Completed TP4 Q8 MTP2 matrix and postchecks
+
+The same controlled three-repeat512-token matrix completed with zero
+preemptions and expected output overlap in every batch. All12 sequential
+fixture outputs match. Configuration/source equality against MTP3 permits
+only depth, corresponding graph sizes and container-specific roots/hostname.
+
+|Class|C1 decode|C2 aggregate|C3 aggregate|C4 aggregate|
+|---|---:|---:|---:|---:|
+|Math|138.69|217.74|293.59|372.20|
+|Code|124.13|229.19|273.58|391.41|
+|Prose|113.42|184.38|243.37|296.88|
+
+Acceptance C1/C2/C3/C4: math84.03/81.32/81.39/82.72%,
+code87.90/90.18/89.63/89.27%, prose53.44/56.71/55.04/54.33%.
+Higher acceptance does not ensure higher throughput: fewer accepted tokens
+per target pass and verification/draft cost also matter.
+
+Across equally weighted math/code/prose C2--4 cases, the geometric mean of
+MTP2/MTP3 throughput ratios is0.9682; MTP4/MTP3 is0.9843. These small margins
+are not confidence bounds and do not establish a universal best depth.
+MTP2 benefits prose relative to MTP3 but loses on several math/code cases.
+Retain variability: code C2 aggregates236.96/194.60/229.19; prose C1 decode
+113.42/114.23/69.49tok/s. The slower C1 run again has longer client intervals,
+not a diagnosed cause. Separate concurrent checks passed58/58 with zero
+preemptions and long-array output overlap1/2/3/4. Eight C1 padded-context
+measurements (two each at2K/8K/16K/32K) passed with zero preemptions. Their
+median input-token/TTFT rates are3935/3912/3817/3807tok/s and decode medians
+114.34/116.74/114.36/104.82tok/s. The32K decode samples92.57/117.06 retain
+timing variability. This is not240K or concurrent long-context qualification.
+Depth1 and a same750MB-cache no-MTP control are still required before selection.
