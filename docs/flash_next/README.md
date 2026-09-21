@@ -18,6 +18,10 @@ small-row and prefill/graph screens, full-model TP4 no-MTP measurements, and
 a completed TP4 Q8 MTP3 short-prompt concurrency screen. MTP concurrent gains
 remain workload-dependent; profiling and depth selection are still in progress.
 It is default-off and is not part of the historical serving image.
+The [larger-row HC injection extension](hc-inject-mtp.md) has now passed
+installed GPU/compile checks and a repeated TP4 Q8 MTP3 full-model screen.
+Concurrent throughput improved22.9--36.7% versus the same-cache MTP3 baseline;
+prose C1 was slower. Depth selection and that C1 result remain unresolved.
 Revised source files are tracked separately from the original image hashes;
 the byte-for-byte preservation statements below describe the snapshot.
 

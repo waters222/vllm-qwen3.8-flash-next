@@ -47,5 +47,37 @@ checks passed; M4 and M20 are exact unchanged negative controls. No HC methods
 were rebound. A restored dispatch counter verified the installed kernel ran.
 
 This qualifies the bounded integration screen, not complete serving-model
-compilation or speculative GDN/QSA states. Full-model MTP behavior/throughput
-and depth1--4 selection remain pending. Default is off; no production promotion.
+compilation. Default is off; no production promotion.
+
+## Completed TP4 Q8 MTP3 full-model screen
+
+Target AWQ unchanged; Q8 draft-expert weights only, BF16 activations. TP4/PP1,
+no EP, 750MB GPU cache/rank, 56GiB host QSA, 240K context. The configuration
+and old source payloads match previous MTP3 except the two HC source overlays,
+one feature flag and generated container hostname. Three512-token repeats per
+class/concurrency, seed17 and thinking off:
+
+| Class | C1 decode | C2 aggregate | C3 aggregate | C4 aggregate |
+|---|---:|---:|---:|---:|
+|Math|164.07|243.06|316.50|372.42|
+|Code|167.28|240.74|339.04|406.26|
+|Prose|97.74|162.63|239.56|281.10|
+
+All36 batches pass token/timing/counter audits, with zero preemptions and
+expected output overlap. Compared with previous same-cache MTP3, C2--4 gain
+22.9--36.7%. Math/code C1 change -0.4%/-2.8%, while prose C1 is20% lower.
+That lower result remains unresolved; do not claim universal improvement.
+Acceptance C1/C2/C3/C4: math72.38/76.75/75.73/74.76%,
+code82.47/83.69/82.10/83.35%, prose42.86/44.52/44.41/45.68%.
+
+All12 sequential fixture outputs match the historical result, including its
+known case-sensitive `No` mismatch. Separate concurrent checks passed58/58,
+including a longer integer-array output with observed overlap1/2/3/4 and
+zero preemptions. The concurrent yes/no check is explicitly case-insensitive.
+Greedy free-form outputs varied in both old and new runs, including noMTP;
+token equality is not asserted and this is not broad model-quality evaluation.
+
+NoMTP comparisons retain a cache-budget difference (275MB versus750MB/rank).
+Depth1/2/4 comparisons and the balanced default remain pending. Full-model
+performance evidence and raw data are in the operations repository's
+`tp4-current/q8-mtp3-hc/` benchmark directory.
