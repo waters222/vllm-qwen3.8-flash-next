@@ -6,6 +6,10 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.ops.flash_next_prefill_checkpoint import (
+    PrefillCheckpoint,
+    build_prefill_checkpoint,
+)
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -51,6 +55,7 @@ class ShortConvAttentionMetadataBuilder(
 
 @dataclass
 class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
+    prefill_checkpoint: PrefillCheckpoint | None = None
     # Number of speculative-decode (multi-query / MTP) requests and the total
     # number of tokens they contribute. These are 0 when spec-decode is off.
     num_spec_decodes: int = 0
@@ -224,6 +229,11 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
 
         return replace(
             metadata,
+            prefill_checkpoint=build_prefill_checkpoint(
+                common_attn_metadata, self.kv_cache_spec, self.vllm_config,
+                list(range(common_attn_metadata.num_reqs)),
+                common_attn_metadata.query_start_loc_cpu,
+            ) if metadata.num_prefills > 0 else None,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             spec_query_len=self.num_spec + 1,
             max_prefill_query_len=max_prefill_query_len,
@@ -487,6 +497,10 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
         return PleShortConvAttentionMetadata(
+            prefill_checkpoint=build_prefill_checkpoint(
+                m, self.kv_cache_spec, self.vllm_config,
+                non_spec_req_idx_cpu.tolist(), non_spec_query_start_loc_cpu,
+            ) if num_prefills > 0 else None,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,

@@ -285,6 +285,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 )
                 for idx in range(self.num_mtp_layers)
             )
+            for layer in self.layers:
+                layer.self_attn._qsa_is_mtp_draft = True
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
             Qwen4ExpSparseMoeBlock,

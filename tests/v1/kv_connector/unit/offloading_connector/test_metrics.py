@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -20,10 +27,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.v1.kv_offload.base import (
+    LookupResult,
     OffloadingCounterMetadata,
     OffloadingGaugeMetadata,
     OffloadingHistogramMetadata,
+    ReqContext,
+    make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics
 
@@ -683,6 +695,37 @@ def test_prom_metrics_uses_configured_manager_metrics():
     )
 
     assert STORES_SKIPPED not in prom_metrics._offloading_metric_metadata
+
+
+def test_idle_expiry_reaches_native_prometheus_once(monkeypatch):
+    """Export manager deltas through real native metric definitions and counters."""
+    clock = [0.0]
+    monkeypatch.setattr("vllm.v1.kv_offload.cpu.manager.monotonic", lambda: clock[0])
+    registry = CollectorRegistry()
+    exporter = OffloadPromMetrics(
+        vllm_config=_FakeVllmConfig(store_threshold=0),  # type: ignore[arg-type]
+        metric_types={
+            kind: partial(kind, registry=registry)
+            for kind in (Counter, Gauge, Histogram)
+        },  # type: ignore[arg-type]
+        labelnames=["model_name", "engine"],
+        per_engine_labelvalues={0: ["test-model", "0"]},
+    )
+    manager = CPUOffloadingManager(num_chunks=1, idle_ttl_seconds=3600)
+    context = ReqContext(req_id="expiry-metric")
+    key = make_offload_key(b"prefix", 0)
+    manager.prepare_store([key], context)
+    manager.complete_store([key], context)
+    metric = CPUOffloadingMetrics.CPU_CACHE_EXPIRED_CHUNKS + "_total"
+    labels = {"model_name": "test-model", "engine": "0"}
+    for now, expected in ((3599, 0), (3600, 1), (7200, 1)):
+        clock[0] = now
+        stats = manager.get_stats()
+        assert stats is not None
+        exporter.observe(stats.to_dict())
+        assert registry.get_sample_value(metric, labels) == expected
+        assert metric.encode() in generate_latest(registry)
+    assert manager.lookup(key, context) is LookupResult.MISS
 
 
 def test_prom_metrics_registers_tiering_metrics_from_spec():

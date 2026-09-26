@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MLAAttentionSpec,
+    get_direct_host_cache_options,
 )
 
 
@@ -850,12 +851,22 @@ class QSAKeyStateCache(_QSAStateCache):
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"
         )
+        replay_alignment = None
+        if get_direct_host_cache_options(vllm_config) is not None:
+            if self.compress_ratio != 4 or (
+                vllm_config.attention_config.resolve_indexer_kv_dtype("bf16") != "bf16"
+            ):
+                raise ValueError(
+                    "Direct host ring replay is qualified only for BF16/CR4"
+                )
+            replay_alignment = self.compress_ratio
         return CircularBufferSpec(
             block_size=capacity,
             num_kv_heads=1,
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
+            replay_alignment=replay_alignment,
         )
 
 

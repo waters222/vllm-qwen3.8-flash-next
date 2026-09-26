@@ -30,6 +30,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
+    TransferResult,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -186,6 +187,103 @@ class BareExternalOffloadingSpec(OffloadingSpec):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("is_load", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_event_poll_error_reaches_rpc_failure_without_cache_ack(
+    is_load, async_scheduling
+):
+    """Exercise native error propagation; the event fault is injected on CPU."""
+    from collections import deque
+    from queue import Queue
+    from types import SimpleNamespace
+
+    from vllm.v1.executor.multiproc_executor import WorkerProc
+    from vllm.v1.kv_offload.cpu.gpu_worker import (
+        CPUOffloadingWorker,
+        SingleDirectionOffloadingHandler,
+    )
+
+    connector, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    handler = SingleDirectionOffloadingHandler.__new__(SingleDirectionOffloadingHandler)
+    event = MagicMock()
+    event.query.side_effect = RuntimeError("injected cache event query failure")
+    transfer = SimpleNamespace(job_id=42, end_event=event)
+    handler._transfers = deque([transfer])
+    handler._transfer_events = {42: event}
+    handler._stream_pool, handler._event_pool, handler._buffer_pool = [], [], []
+    backend = CPUOffloadingWorker.__new__(CPUOffloadingWorker)
+    other = MagicMock()
+    other.get_finished.return_value = []
+    backend._load_handler = handler if is_load else other
+    backend._store_handler = other if is_load else handler
+    connector.worker = backend
+    if is_load:
+        connector._load_jobs[42] = "req"
+
+    proc = WorkerProc.__new__(WorkerProc)
+    proc.rank, proc.use_async_scheduling = 0, async_scheduling
+    proc.async_output_queue = Queue()
+    proc.worker = SimpleNamespace(poll=lambda: connector.get_finished(set()))
+    proc.worker_response_mq = MagicMock()
+    proc._execute_worker_rpc(("poll", (), {}, None))
+    if async_scheduling:
+        proc.worker_response_mq.enqueue.assert_not_called()
+        # One deterministic queue drain; no claim about background-thread races.
+        proc.enqueue_output(proc.async_output_queue.get_nowait())
+        assert proc.async_output_queue.empty()
+
+    proc.worker_response_mq.enqueue.assert_called_once_with(
+        (WorkerProc.ResponseStatus.FAILURE, "injected cache event query failure")
+    )
+    assert connector.build_connector_worker_meta() is None
+    assert connector._load_jobs == ({42: "req"} if is_load else {})
+    assert list(handler._transfers) == [transfer]
+    assert handler._transfer_events == {42: event}
+    assert (
+        not handler._stream_pool
+        and not handler._event_pool
+        and not handler._buffer_pool
+    )
+
+
+@pytest.mark.parametrize("is_load", [False, True])
+def test_failed_completion_does_not_acknowledge_or_release_load(is_load):
+    """Native fail-fast behavior must not publish partially transferred state."""
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    if is_load:
+        worker._load_jobs[42] = "req"
+    worker.worker.get_finished.return_value = [
+        TransferResult(job_id=42, success=False, transfer_size=1024, transfer_time=0.1)
+    ]
+    with pytest.raises(AssertionError):
+        worker.get_finished(set())
+    assert worker.build_connector_worker_meta() is None
+    assert worker._load_jobs == ({42: "req"} if is_load else {})
+
+
+@pytest.mark.parametrize("is_load", [False, True])
+def test_rejected_submission_does_not_publish_completion(is_load):
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker.worker.submit_load.return_value = False
+    worker.worker.submit_store.return_value = False
+    if not is_load:
+        worker.prepare_store_kv(_store_metadata(42))
+    with pytest.raises(AssertionError):
+        worker.start_kv_transfers(_load_metadata(42) if is_load else _empty_metadata())
+    assert worker.build_connector_worker_meta() is None
+    if is_load:
+        assert worker._load_jobs == {42: "req"}
+    else:
+        assert len(worker._unsubmitted_store_jobs) == 1
+        assert worker._unsubmitted_store_jobs[0][0] == 42
 
 
 def test_prepare_store_kv_non_writer_marks_completed_without_submit():

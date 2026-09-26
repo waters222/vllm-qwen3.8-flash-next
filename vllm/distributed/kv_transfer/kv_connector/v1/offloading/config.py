@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheGroupRole,
     KVCacheSpec,
@@ -35,7 +36,16 @@ if TYPE_CHECKING:
 
 def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
     if kv_cache_config.hisparse_host_num_blocks is None:
-        return tuple(range(len(kv_cache_config.kv_cache_groups)))
+        return tuple(
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if not group.host_resident
+            and not all(
+                isinstance(spec, CircularBufferSpec)
+                and spec.replay_alignment is not None
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            )
+        )
     return tuple(
         group_id
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -50,6 +60,8 @@ def _group_kv_bytes_per_block(group: "KVCacheGroupSpec") -> int:
     configs flatten that wrapper to one representative per-layer spec.  Keep
     the result invariant across those two representations.
     """
+    if not group.layer_names:
+        return 0
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return spec.page_size_bytes
@@ -63,7 +75,9 @@ def build_offloading_config(
     """Translate vLLM configuration into the native offloading boundary."""
     kv_transfer_config = vllm_config.kv_transfer_config
     assert kv_transfer_config is not None
-    extra_config = kv_transfer_config.kv_connector_extra_config
+    extra_config = dict(kv_transfer_config.kv_connector_extra_config)
+    if kv_cache_config.direct_host_num_blocks is not None:
+        extra_config.setdefault("idle_ttl_seconds", 3600)
     assert kv_transfer_config.engine_id is not None
     engine_id = kv_transfer_config.engine_id
 
@@ -149,6 +163,29 @@ def build_offloading_config(
         worker_kv_bytes_per_block = sum(
             _group_kv_bytes_per_block(group) for _, group in selected_groups
         )
+
+    common_slot = kv_cache_config.direct_host_offload_bytes_per_block
+    if kv_cache_config.direct_host_num_blocks is not None:
+        packed_stride = kv_cache_config.direct_host_offload_packed_stride
+        if packed_stride is not None:
+            device_tensors = [
+                t for t in kv_cache_config.kv_cache_tensors if not t.host_resident
+            ]
+            if not device_tensors or any(
+                t.size != packed_stride * kv_cache_config.num_blocks
+                or t.block_stride != packed_stride
+                for t in device_tensors
+            ):
+                raise ValueError(
+                    "Direct host packed offload has inconsistent GPU layout"
+                )
+            worker_kv_bytes_per_block = packed_stride
+        if common_slot is None and parallel_config.pipeline_parallel_size > 1:
+            raise ValueError("Direct host PP offload requires a common CPU slot size")
+        if common_slot is not None:
+            if common_slot < worker_kv_bytes_per_block:
+                raise ValueError("Direct host CPU slot cannot fit this worker's KV")
+            worker_kv_bytes_per_block = common_slot
 
     single_group_spec = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec

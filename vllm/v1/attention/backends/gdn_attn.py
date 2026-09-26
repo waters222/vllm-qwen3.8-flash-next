@@ -8,6 +8,10 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.ops.flash_next_prefill_checkpoint import (
+    PrefillCheckpoint,
+    build_prefill_checkpoint,
+)
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -72,6 +76,7 @@ class GDNAttentionMetadata:
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
+    prefill_checkpoint: PrefillCheckpoint | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -215,6 +220,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+
+        from vllm.v1.attention.backends.flash_gdn_spec_metadata import try_build
+
+        fused = try_build(
+            self, m, GDNAttentionMetadata, num_accepted_tokens,
+            num_decode_draft_tokens_cpu, fast_build,
+        )
+        if fused is not None:
+            return fused
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
@@ -493,6 +507,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
+        checkpoint = None
+        if num_prefills > 0 and self.kv_cache_spec.num_prefill_checkpoint_blocks:
+            request_rows = (
+                (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
+                if spec_sequence_masks_cpu is not None
+                else list(range(num_decodes, m.num_reqs))
+            )
+            checkpoint = build_prefill_checkpoint(
+                m, self.kv_cache_spec, self.vllm_config,
+                request_rows, prefill_query_start_loc_cpu,
+            )
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -507,6 +532,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
+            prefill_checkpoint=checkpoint,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,

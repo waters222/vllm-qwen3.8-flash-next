@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
+from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -15,13 +16,16 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    DirectHostFullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
+from vllm.v1.hisparse.block_pool import IdleExpiringHostBlockPool
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -151,6 +155,7 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        self._bind_direct_host_pool()
         # Match Mamba checkpoints to Eagle's attention replay boundary.
         if use_eagle:
             for manager in self.single_type_managers:
@@ -167,6 +172,40 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+
+    def _bind_direct_host_pool(self) -> None:
+        config = self.kv_cache_config
+        host_ids = [
+            i
+            for i, group in enumerate(config.kv_cache_groups)
+            if group.role is KVCacheGroupRole.DIRECT_HOST
+        ]
+        capacity = config.direct_host_num_blocks
+        if not host_ids and capacity is None:
+            return
+        if (
+            not host_ids
+            or capacity is None
+            or capacity < 2
+            or config.hisparse_host_num_blocks is not None
+            or any(not config.kv_cache_groups[i].host_resident for i in host_ids)
+            or set(host_ids) != set(config.host_group_ids)
+        ):
+            raise ValueError("Direct host KV requires a dedicated, valid host layout")
+        host_pool = IdleExpiringHostBlockPool(
+            num_gpu_blocks=capacity,
+            enable_caching=self.block_pool.enable_caching,
+            hash_block_size=self.block_pool.hash_block_size,
+            enable_kv_cache_events=self.block_pool.enable_kv_cache_events,
+            metrics_collector=self.block_pool.metrics_collector,
+            medium=MEDIUM_CPU,
+            event_owner=self.block_pool,
+            idle_ttl_seconds=config.direct_host_idle_ttl_seconds,
+        )
+        for i in host_ids:
+            manager = self.single_type_managers[i]
+            assert isinstance(manager, DirectHostFullAttentionManager)
+            manager.bind_host_pool(host_pool)
 
     def get_num_blocks_to_allocate(
         self,
@@ -202,14 +241,16 @@ class KVCacheCoordinator(ABC):
                 leave it False so the predictor matches `allocate_new_blocks`.
 
         Returns:
-            The number of blocks to allocate.
+            The number of device blocks to allocate. If any independent pool
+            lacks capacity, return more than the device pool's total capacity
+            so the caller rejects admission before acquiring any blocks.
         """
-        num_blocks_to_allocate = 0
+        required_by_pool: dict[BlockPool, int] = {}
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                required = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -219,7 +260,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                required = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -228,7 +269,12 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-        return num_blocks_to_allocate
+            pool = manager.block_pool
+            required_by_pool[pool] = required_by_pool.get(pool, 0) + required
+        for pool, required in required_by_pool.items():
+            if pool is not self.block_pool and required > pool.get_num_free_blocks():
+                return self.block_pool.num_gpu_blocks + 1
+        return required_by_pool.get(self.block_pool, 0)
 
     def allocate_new_computed_blocks(
         self,
@@ -586,7 +632,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
-            block_pool=self.block_pool,
+            block_pool=self.single_type_managers[0].block_pool,
             kv_cache_spec=self.kv_cache_spec,
             drop_eagle_block=0 in self.eagle_group_ids,
             alignment_tokens=self.block_size,
@@ -902,7 +948,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
                 drop_eagle_block = use_eagle and idx not in eagle_verified
 
-                _max_length = curr_hit_length
+                # A connector may restore an evicted device group while using
+                # an independently resident host prefix. Preserve those pages
+                # even when an earlier group already reduced the local hit.
+                retains_longer_hit = manager_cls.retains_longer_hit
+                _max_length = (
+                    max_cache_hit_length if retains_longer_hit else curr_hit_length
+                )
                 # Eagle matches one extra drop unit (one hash unit for
                 # fine-grained managers, else one cache block) and then drops
                 # it, landing back at the candidate length. No margin for
@@ -916,9 +968,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         and group_block_size > self.hash_block_size
                         else group_block_size
                     )
-                    _max_length = min(
-                        curr_hit_length + eagle_margin, max_cache_hit_length
-                    )
+                    _max_length = min(_max_length + eagle_margin, max_cache_hit_length)
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
                     max_length=_max_length,
@@ -939,12 +989,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
-                curr_hit_length = _new_hit_length
+                curr_hit_length = (
+                    min(curr_hit_length, _new_hit_length)
+                    if retains_longer_hit
+                    else _new_hit_length
+                )
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
                     hit_length_by_group[group_id] = _new_hit_length
 
-                longest_hit_length = max(longest_hit_length, curr_hit_length)
+                longest_hit_length = max(longest_hit_length, _new_hit_length)
 
             if curr_hit_length >= hit_length:
                 break

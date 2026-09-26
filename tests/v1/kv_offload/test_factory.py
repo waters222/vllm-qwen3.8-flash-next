@@ -21,6 +21,7 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -93,6 +94,53 @@ def _make_offloading_config(
 
 def _create_spec(**kwargs: Any) -> OffloadingSpec:
     return OffloadingSpecFactory.create_spec(_make_offloading_config(**kwargs))
+
+
+@pytest.mark.parametrize("ttl", [None, 3600, 120.5])
+def test_cpu_spec_passes_idle_expiry_to_native_manager(ttl):
+    spec = _create_spec(extra_config={"idle_ttl_seconds": ttl})
+    assert spec.get_manager().idle_ttl_seconds == ttl
+
+
+def test_expiry_counter_registered_even_when_ttl_default_is_injected_later():
+    definitions = CPUOffloadingSpec.build_metric_definitions({})
+    assert CPUOffloadingMetrics.CPU_CACHE_EXPIRED_CHUNKS in definitions
+
+
+@pytest.mark.parametrize("matches", [True, False])
+def test_pp_mmap_geometry_is_checked_across_workers(monkeypatch, matches):
+    import vllm.v1.kv_offload.cpu.spec as module
+
+    group = MagicMock()
+    monkeypatch.setattr(module, "_all_workers_group", lambda: group)
+    monkeypatch.setattr(module.torch.distributed, "get_world_size", lambda g: 4)
+
+    def gather(layouts, geometry, *, group):
+        layouts[:] = [geometry] * 4
+        if not matches:
+            layouts[2] = (geometry[0], geometry[1] * 2, geometry[2] * 2)
+
+    monkeypatch.setattr(module.torch.distributed, "all_gather_object", gather)
+    if matches:
+        module._validate_pp_mmap_geometry((128, 65536, 16384))
+    else:
+        with pytest.raises(ValueError, match="disagree"):
+            module._validate_pp_mmap_geometry((128, 65536, 16384))
+
+
+def test_pp_mmap_mismatch_fails_before_any_region_is_opened(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as module
+
+    spec = _create_spec(world_size=4, tp_size=2, pp_size=2)
+    monkeypatch.setattr(spec, "_uses_shared_region", lambda: True)
+    validate = MagicMock(side_effect=ValueError("disagree"))
+    region = MagicMock()
+    monkeypatch.setattr(module, "_validate_pp_mmap_geometry", validate)
+    monkeypatch.setattr(module, "SharedOffloadRegion", region)
+    with pytest.raises(ValueError, match="disagree"):
+        spec.create_worker(MagicMock())
+    validate.assert_called_once()
+    region.assert_not_called()
 
 
 class SingleArgExternalOffloadingSpec(OffloadingSpec):
@@ -325,8 +373,9 @@ def test_cpu_spec_replicated_disabled_without_shared_region(
 
 @pytest.mark.parametrize("config_replicated", [True, False])
 @pytest.mark.parametrize("cuda_alike", [True, False])
+@pytest.mark.parametrize("use_shared_memory", [True, False])
 def test_cpu_spec_replicated_layout_truth_matrix(
-    monkeypatch, cuda_alike: bool, config_replicated: bool
+    monkeypatch, cuda_alike: bool, config_replicated: bool, use_shared_memory: bool
 ):
     # replicated_layout is enabled iff the config gate passes AND the deployment
     # actually allocates on the shared region (CUDA-alike).
@@ -341,10 +390,19 @@ def test_cpu_spec_replicated_layout_truth_matrix(
         worker_kv_bytes_per_block=worker_kv_bytes_per_block,
         world_size=4,
         replicated_layout=config_replicated,
+        extra_config={"use_shared_memory": use_shared_memory},
     )
 
     assert isinstance(spec, CPUOffloadingSpec)
-    assert spec.replicated_layout is (cuda_alike and config_replicated)
+    assert spec.replicated_layout is (
+        cuda_alike and config_replicated and use_shared_memory
+    )
+
+
+@pytest.mark.parametrize("invalid", [None, "false", 0, 1])
+def test_cpu_spec_rejects_ambiguous_shared_memory_selection(invalid):
+    with pytest.raises(ValueError, match="use_shared_memory must be a boolean"):
+        _create_spec(extra_config={"use_shared_memory": invalid})
 
 
 def test_cpu_spec_create_worker_uses_mmap_on_cuda_alike(monkeypatch):
@@ -386,10 +444,17 @@ def test_cpu_spec_create_worker_uses_mmap_on_cuda_alike(monkeypatch):
     assert worker_calls[0]["mmap_region"] is region
 
 
-def test_cpu_spec_create_worker_uses_tensor_path_off_cuda_alike(monkeypatch):
+@pytest.mark.parametrize("cuda_alike", [False, True])
+def test_cpu_spec_create_worker_uses_existing_private_tensor_path(
+    monkeypatch, cuda_alike
+):
     import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
 
-    spec = _create_spec(worker_kv_bytes_per_block=4096, world_size=4)
+    spec = _create_spec(
+        worker_kv_bytes_per_block=4096,
+        world_size=4,
+        extra_config={"use_shared_memory": False},
+    )
     assert isinstance(spec, CPUOffloadingSpec)
 
     region_calls: list[dict[str, Any]] = []
@@ -404,14 +469,14 @@ def test_cpu_spec_create_worker_uses_tensor_path_off_cuda_alike(monkeypatch):
         return MagicMock()
 
     monkeypatch.setattr(
-        cpu_spec_module.current_platform, "is_cuda_alike", lambda: False
+        cpu_spec_module.current_platform, "is_cuda_alike", lambda: cuda_alike
     )
     monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", fake_region_ctor)
     monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", fake_worker_ctor)
 
     spec.create_worker(MagicMock())
 
-    # Non-CUDA-alike platforms keep the per-rank pinned-tensor path.
+    # Explicit private allocation never constructs or registers a shared mmap.
     assert region_calls == []
     assert worker_calls[0]["mmap_region"] is None
 

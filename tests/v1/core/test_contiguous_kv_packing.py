@@ -9,26 +9,50 @@ block dim (a contiguous region per layer) or inside it (all layers' pages within
 block); the allocation is the same either way.
 """
 
+from collections import deque
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from vllm.config import CacheConfig
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
+    get_offloading_group_ids,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    get_sliding_window_size_in_chunks,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+    OffloadingConnector,
+)
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_bytes_per_block,
     _get_packed_kv_cache_groups,
     _pool_bytes_per_block,
+    _project_kv_cache_groups_to_worker,
     generate_scheduler_kv_cache_config,
+    get_direct_host_kv_cache_configs,
     get_kv_cache_config_from_groups,
+    get_kv_cache_configs,
     get_kv_cache_groups,
+    get_request_block_hasher,
+    init_none_hash,
     resolve_kv_cache_block_sizes,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
+    DirectHostAttentionSpec,
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheSpec,
@@ -36,9 +60,15 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    get_direct_host_cache_options,
     iter_layer_specs,
+    replace_as,
 )
-from vllm.v1.worker.utils import allocate_kv_cache
+from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.request import Request
+from vllm.v1.worker.utils import _allocate_kv_cache, allocate_kv_cache
 
 MEMORY = 8 * 1024 * 1024
 
@@ -76,6 +106,7 @@ def _mock_vllm_config(layout: str | None):
     config.cache_config.num_gpu_blocks_override = None
     config.cache_config.kv_cache_layout = layout
     config.attention_config.hisparse_config = None
+    config.kv_transfer_config = None
     return config
 
 
@@ -173,6 +204,1093 @@ def _shared_layout_config():
     config.cache_config.prefix_match_unit = None
     config.cache_config.mamba_cache_mode = "none"
     return config
+
+
+class TestDirectHostPipelinePacking:
+    """Keep shared logical IDs but allocate only each stage's owned pages."""
+
+    def test_deferred_free_keeps_host_owner_and_starts_ttl_after_fence(
+        self, monkeypatch
+    ):
+        """A flattened deferred list must not put RAM pages in the GPU free queue."""
+        now = [0.0]
+        monkeypatch.setattr("vllm.v1.hisparse.block_pool.monotonic", lambda: now[0])
+        init_none_hash(sha256)
+        config = KVCacheConfig(
+            num_blocks=5,
+            direct_host_num_blocks=7,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["device"], _full()),
+                KVCacheGroupSpec(
+                    ["host"],
+                    _full(),
+                    host_resident=True,
+                    role=KVCacheGroupRole.DIRECT_HOST,
+                ),
+            ],
+        )
+        manager = KVCacheManager(
+            config, max_model_len=64, scheduler_block_size=16, hash_block_size=16
+        )
+        host = manager.coordinator.single_type_managers[1].block_pool
+        pools = (manager.block_pool, host)
+        capacity = [pool.get_num_free_blocks() for pool in pools]
+        request = Request(
+            "inflight",
+            list(range(49)),
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=get_request_block_hasher(16, sha256),
+        )
+        assert manager.allocate_slots(request, 32) is not None
+        request.num_computed_tokens = 32
+        manager.cache_blocks(request, 32)
+        pages = manager.get_blocks(request.request_id).blocks
+        assert [page.block_id for page in pages[0]] == [
+            page.block_id for page in pages[1]
+        ]
+        request.last_sched_seq = 2
+        scheduler = object.__new__(Scheduler)
+        scheduler.kv_cache_manager = manager
+        scheduler.defer_block_free = True
+        scheduler.sched_step_seq = 2
+        scheduler.processed_step_seq = 0
+        scheduler.deferred_frees = deque()
+        scheduler._free_request_blocks(request)
+        held_capacity = [pool.get_num_free_blocks() for pool in pools]
+        now[0] = 7200
+        scheduler.processed_step_seq = 1
+        scheduler._drain_deferred_frees()
+        assert len(scheduler.deferred_frees) == 1
+        assert host.expire_idle() == 0
+        assert all(page.ref_cnt == 1 for group in pages for page in group)
+        assert [pool.get_num_free_blocks() for pool in pools] == held_capacity
+        scheduler.processed_step_seq = 2
+        scheduler._drain_deferred_frees()
+        assert not scheduler.deferred_frees
+        assert [pool.get_num_free_blocks() for pool in pools] == capacity
+        assert all(page.ref_cnt == 0 for group in pages for page in group)
+        now[0] = 10799
+        assert host.expire_idle() == 0
+        now[0] = 10800
+        assert host.expire_idle() == 2
+        for pool in pools:
+            allocated = pool.get_new_blocks(pool.get_num_free_blocks())
+            assert all(page.pool is pool for page in allocated)
+            assert all(pool.blocks[page.block_id] is page for page in allocated)
+            pool.free_blocks(allocated)
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_native_cold_capacity_counts_packed_gpu_blocks_not_aliased_layers(
+        self, device
+    ):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("Native DMA needs CUDA")
+        config, _, _, small = self.setup()
+        stride = 2 * small.page_size_bytes
+        state = MambaSpec(
+            block_size=16,
+            shapes=((4, 64), (32, 64)),
+            dtypes=(torch.bfloat16, torch.float32),
+            page_size_padded=stride,
+        )
+        groups = (
+            [KVCacheGroupSpec(["a", "b"], small)]
+            + [KVCacheGroupSpec([f"mamba.{i}"], state) for i in range(3)]
+            + [
+                KVCacheGroupSpec(
+                    ["scratch"],
+                    CircularBufferSpec(
+                        block_size=4,
+                        num_kv_heads=1,
+                        head_size=8,
+                        dtype=torch.bfloat16,
+                        replay_alignment=4,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["host"],
+                    small,
+                    host_resident=True,
+                    enable_kv_transfer=False,
+                    role=KVCacheGroupRole.DIRECT_HOST,
+                ),
+            ]
+        )
+        specs = {
+            name: group.kv_cache_spec for group in groups for name in group.layer_names
+        }
+        plan = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            [specs],
+            [MEMORY],
+            host_num_blocks=7,
+            host_max_bytes=MEMORY,
+        )[0]
+        assert plan.direct_host_offload_bytes_per_block == stride
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+            OffloadingConnectorWorker,
+        )
+
+        config.parallel_config.tensor_parallel_size = 1
+        config.parallel_config.cp_kv_cache_interleave_size = 1
+        spec = MagicMock()
+        spec.replicated_layout = False
+        worker = OffloadingConnectorWorker(spec, config, plan)
+        # No pinned allocation is needed to verify device-only registration.
+        device_plan = replace(
+            plan,
+            kv_cache_tensors=[t for t in plan.kv_cache_tensors if not t.host_resident],
+        )
+        caches = _allocate_kv_cache(
+            device_plan, torch.device(device), KVCacheLayout.BLNHC
+        )
+        caches["host"] = torch.full((7, 16, 2, 128), 17, dtype=torch.bfloat16)
+        worker.register_kv_caches(caches)
+        canonical = spec.get_worker.call_args.args[0]
+        assert len(canonical.tensors) == 1
+        assert canonical.tensors[0].page_size_bytes == stride
+        assert len(canonical.group_data_refs) == 4
+        assert all(
+            len(refs) == 1 and refs[0].page_size_bytes == stride
+            for refs in canonical.group_data_refs
+        )
+        spec.get_worker.reset_mock()
+        with pytest.raises(ValueError, match="do not share"):
+            worker.register_kv_caches({**caches, "b": caches["b"].clone()})
+        spec.get_worker.assert_not_called()
+
+        if device == "cuda":
+            from vllm.v1.kv_offload.base import GPULoadStoreSpec
+            from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+            from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+
+            backing = canonical.tensors[0].tensor
+            generator = torch.Generator(device=device).manual_seed(173)
+            backing.copy_(
+                torch.randint(
+                    0,
+                    127,
+                    backing.shape,
+                    device=device,
+                    dtype=torch.int8,
+                    generator=generator,
+                )
+            )
+            expected = backing.clone()
+            transfer = CPUOffloadingWorker(
+                canonical, blocks_per_chunk=1, num_cpu_chunks=16
+            )
+            try:
+                source = GPULoadStoreSpec(
+                    [1, 3, 5, 7], group_sizes=(1, 1, 1, 1), block_indices=(0, 0, 0, 0)
+                )
+                cold = CPULoadStoreSpec([2, 4, 6, 8])
+                assert transfer.submit_store(1, source, cold)
+                transfer.wait({1})
+                target = GPULoadStoreSpec(
+                    [2, 4, 6, 8], group_sizes=(1, 1, 1, 1), block_indices=(0, 0, 0, 0)
+                )
+                assert transfer.submit_load(2, cold, target)
+                transfer.wait({2})
+                expected[[2, 4, 6, 8]] = expected[[1, 3, 5, 7]]
+                assert torch.equal(backing, expected)
+                assert bool((caches["host"] == 17).all())
+            finally:
+                transfer.shutdown()
+
+        config.cache_config.kv_cache_layout = "LBNHC"
+        groups = [
+            replace(group, kv_cache_spec=small)
+            for group in groups
+            if "scratch" not in group.layer_names
+        ]
+        specs = {name: small for name in specs if name != "scratch"}
+        fallback = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            [specs],
+            [MEMORY],
+            host_num_blocks=7,
+            host_max_bytes=MEMORY,
+        )[0]
+        assert fallback.direct_host_offload_packed_stride is None
+        assert fallback.direct_host_offload_bytes_per_block == 5 * small.page_size_bytes
+
+    def test_uneven_pp_workers_share_one_native_cpu_chunk_geometry(self):
+        config, _, _, small = self.setup()
+        config.kv_transfer_config = SimpleNamespace(
+            engine_id="pp-geometry",
+            kv_connector_extra_config={
+                "cpu_bytes_to_use": MEMORY,
+            },
+        )
+        config.kv_events_config = None
+        config.parallel_config.world_size = 4
+        config.parallel_config.tensor_parallel_size = 2
+        config.parallel_config.pipeline_parallel_size = 2
+        config.parallel_config.prefill_context_parallel_size = 1
+        config.model_config.dtype = torch.float16
+        groups = [
+            KVCacheGroupSpec(["gpu.0", "gpu.1", "gpu.2"], small),
+            KVCacheGroupSpec(
+                ["host.0", "host.1"],
+                small,
+                host_resident=True,
+                enable_kv_transfer=False,
+                role=KVCacheGroupRole.DIRECT_HOST,
+            ),
+        ]
+        stage0 = {"gpu.0": small, "host.0": small}
+        stage1 = {"gpu.1": small, "gpu.2": small, "host.1": small}
+        plans = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            [stage0, stage0, stage1, stage1],
+            [MEMORY] * 4,
+            host_num_blocks=7,
+            host_max_bytes=MEMORY,
+        )
+        scheduler = generate_scheduler_kv_cache_config(plans)
+        specs = [
+            CPUOffloadingSpec(build_offloading_config(config, plan))
+            for plan in [*plans, scheduler]
+        ]
+        geometry = {
+            (spec.num_chunks, spec.kv_bytes_per_chunk, spec.cpu_page_size_per_worker)
+            for spec in specs
+        }
+        assert len(geometry) == 1, geometry
+        plans[-1].direct_host_offload_bytes_per_block = small.page_size_bytes
+        with pytest.raises(ValueError, match="cannot fit"):
+            build_offloading_config(config, plans[-1])
+        with pytest.raises(AssertionError):
+            generate_scheduler_kv_cache_config(plans)
+
+    @pytest.mark.parametrize("host_first", [False, True])
+    @pytest.mark.parametrize("draft", [False, True])
+    def test_cold_device_hit_reuses_resident_host_pages(self, host_first, draft):
+        """A device miss must not hide RAM pages needed by an external hit."""
+        init_none_hash(sha256)
+        device = KVCacheGroupSpec(["device"], replace(_mla(128), block_size=16))
+        host = KVCacheGroupSpec(
+            ["host"],
+            _full(),
+            is_eagle_group=draft,
+            host_resident=True,
+            role=KVCacheGroupRole.DIRECT_HOST,
+        )
+        config = KVCacheConfig(
+            num_blocks=16,
+            direct_host_num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[host, device] if host_first else [device, host],
+        )
+        host_id = 0 if host_first else 1
+        manager = KVCacheManager(
+            config, max_model_len=64, scheduler_block_size=16, hash_block_size=16
+        )
+        hasher = get_request_block_hasher(16, sha256)
+        request = Request(
+            "source",
+            list(range(49)),
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=hasher,
+        )
+        assert manager.allocate_slots(request, 48) is not None
+        original = manager.get_block_ids(request.request_id)[host_id][:]
+        request.num_computed_tokens = 48
+        manager.cache_blocks(request, 48)
+        manager.free(request)
+        pool = manager.block_pool
+        evicted = pool.get_new_blocks(pool.get_num_free_blocks())
+        pool.free_blocks(evicted)
+        repeat = Request(
+            "repeat",
+            list(range(49)),
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=hasher,
+        )
+        connector = object.__new__(OffloadingConnector)
+        connector._kv_cache_config = config
+        connector._kv_cache_manager = manager
+        boundary = 32 if draft else 48
+        assert connector._max_loadable_tokens(repeat, 0) == boundary
+        hits, local, _ = manager.get_computed_blocks(repeat)
+        assert local == 0
+        assert [b.block_id for b in hits.blocks[host_id]] == original[: boundary // 16]
+        assert (
+            manager.allocate_slots(
+                repeat,
+                0,
+                new_computed_blocks=hits,
+                num_external_computed_tokens=boundary,
+            )
+            is not None
+        )
+        assert (
+            manager.get_block_ids(repeat.request_id)[host_id]
+            == original[: boundary // 16]
+        )
+        manager.free(repeat)
+
+    @pytest.mark.parametrize("host_capacity", [4, 8])
+    @pytest.mark.parametrize("restored_tokens", [0, 16, 32])
+    def test_host_hits_beyond_restored_prefix_are_not_writable(
+        self, host_capacity, restored_tokens
+    ):
+        """Recomputed suffixes need private pages, including admission accounting."""
+        init_none_hash(sha256)
+        config = KVCacheConfig(
+            num_blocks=16,
+            direct_host_num_blocks=host_capacity,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["device"], replace(_mla(128), block_size=16)),
+                KVCacheGroupSpec(
+                    ["host"],
+                    _full(),
+                    host_resident=True,
+                    role=KVCacheGroupRole.DIRECT_HOST,
+                ),
+            ],
+        )
+        manager = KVCacheManager(
+            config, max_model_len=64, scheduler_block_size=16, hash_block_size=16
+        )
+        hasher = get_request_block_hasher(16, sha256)
+        source = Request(
+            "source",
+            list(range(49)),
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=hasher,
+        )
+        assert manager.allocate_slots(source, 48) is not None
+        source.num_computed_tokens = 48
+        manager.cache_blocks(source, 48)
+        host = manager.coordinator.single_type_managers[1]
+        retained = list(host.req_to_blocks[source.request_id])
+        # Pin the source pages independently, as another reader would do.
+        host.block_pool.touch(retained)
+        manager.free(source)
+        evicted = manager.block_pool.get_new_blocks(
+            manager.block_pool.get_num_free_blocks()
+        )
+        manager.block_pool.free_blocks(evicted)
+        repeat = Request(
+            "repeat",
+            list(range(49)),
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=hasher,
+        )
+        hits, local, _ = manager.get_computed_blocks(repeat)
+        assert local == 0
+        assert len(hits.blocks[1]) == 3
+        allocated = manager.allocate_slots(
+            repeat,
+            16,
+            new_computed_blocks=hits,
+            num_external_computed_tokens=restored_tokens,
+        )
+        if host_capacity == 4:
+            assert allocated is None
+        else:
+            assert allocated is not None
+            ids = manager.get_block_ids(repeat.request_id)[1]
+            boundary = restored_tokens // 16
+            assert ids[:boundary] == [b.block_id for b in retained[:boundary]]
+            assert len(ids) == boundary + 1
+            assert ids[-1] not in [b.block_id for b in retained]
+            assert retained[boundary].ref_cnt == 1
+        manager.free(repeat)
+        host.block_pool.free_blocks(retained)
+
+    def test_expired_host_prefix_bounds_an_otherwise_live_cold_copy(self, monkeypatch):
+        now = [0.0]
+        monkeypatch.setattr("vllm.v1.hisparse.block_pool.monotonic", lambda: now[0])
+        monkeypatch.setattr("vllm.v1.kv_offload.cpu.manager.monotonic", lambda: now[0])
+        init_none_hash(sha256)
+        config = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            direct_host_num_blocks=4,
+            kv_cache_groups=[
+                KVCacheGroupSpec(["device"], _full()),
+                KVCacheGroupSpec(
+                    ["host"],
+                    _full(),
+                    host_resident=True,
+                    role=KVCacheGroupRole.DIRECT_HOST,
+                ),
+            ],
+        )
+        manager = KVCacheManager(
+            config, max_model_len=64, scheduler_block_size=16, hash_block_size=16
+        )
+        request = Request(
+            "prefix",
+            list(range(33)),
+            SamplingParams(max_tokens=4),
+            None,
+            block_hasher=get_request_block_hasher(16, sha256),
+        )
+        assert manager.allocate_slots(request, 32) is not None
+        request.num_computed_tokens = 32
+        manager.cache_blocks(request, 32)
+        manager.free(request)
+        # Exercise the connector's actual RAM-coverage bound, not a mock of it.
+        connector = object.__new__(OffloadingConnector)
+        connector._kv_cache_config = config
+        connector._kv_cache_manager = manager
+        assert connector._max_loadable_tokens(request, 0) == 32
+        ctx = ReqContext(req_id="prefix")
+        cold = CPUOffloadingManager(2, idle_ttl_seconds=7200)
+        keys = [make_offload_key(h, 0) for h in request.block_hashes]
+        assert cold.prepare_store(keys, ctx) is not None
+        cold.complete_store(keys, ctx)
+        now[0] = 3600
+        assert all(cold.lookup(key, ctx) == LookupResult.HIT for key in keys)
+        assert connector._max_loadable_tokens(request, 0) == 0
+        assert manager.get_computed_blocks(request)[1] == 0
+        assert (
+            manager.coordinator.single_type_managers[1].block_pool.get_num_free_blocks()
+            == 3
+        )
+
+    @pytest.mark.parametrize("branches", [2, 6])
+    def test_shared_host_prefix_branches_release_and_expire_independently(
+        self, monkeypatch, branches
+    ):
+        """Live branches pin shared pages; idle TTL cannot retire another reader."""
+        now = [0.0]
+        monkeypatch.setattr("vllm.v1.hisparse.block_pool.monotonic", lambda: now[0])
+        init_none_hash(sha256)
+        config = KVCacheConfig(
+            num_blocks=32,
+            direct_host_num_blocks=branches + 3,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["device"], _full()),
+                KVCacheGroupSpec(
+                    ["host"],
+                    _full(),
+                    host_resident=True,
+                    role=KVCacheGroupRole.DIRECT_HOST,
+                ),
+            ],
+        )
+        manager = KVCacheManager(
+            config, max_model_len=64, scheduler_block_size=16, hash_block_size=16
+        )
+        hasher = get_request_block_hasher(16, sha256)
+
+        def request(name, suffix):
+            return Request(
+                name,
+                list(range(32)) + [suffix] * 17,
+                SamplingParams(max_tokens=1),
+                None,
+                block_hasher=hasher,
+            )
+
+        source = request("source", 100)
+        assert manager.allocate_slots(source, 32) is not None
+        source.num_computed_tokens = 32
+        manager.cache_blocks(source, 32)
+        host = manager.coordinator.single_type_managers[1]
+        shared = list(host.req_to_blocks[source.request_id])
+        manager.free(source)
+        device_pages = manager.block_pool.get_new_blocks(
+            manager.block_pool.get_num_free_blocks()
+        )
+        manager.block_pool.free_blocks(device_pages)
+        active, suffix_ids = [], set()
+        for i in range(branches):
+            branch = request(str(i), 200 + i)
+            hits, local, _ = manager.get_computed_blocks(branch)
+            assert (
+                manager.allocate_slots(
+                    branch,
+                    16,
+                    num_new_computed_tokens=local,
+                    new_computed_blocks=hits,
+                    num_external_computed_tokens=32 - local,
+                )
+                is not None
+            )
+            pages = host.req_to_blocks[branch.request_id]
+            assert pages[:2] == shared
+            assert pages[2].block_id not in suffix_ids
+            suffix_ids.add(pages[2].block_id)
+            branch.num_computed_tokens = 48
+            manager.cache_blocks(branch, 48)
+            active.append(branch)
+        assert all(page.ref_cnt == branches for page in shared)
+        assert host.block_pool.get_num_free_blocks() == 0
+        overflow = request("overflow", 300)
+        hits, local, _ = manager.get_computed_blocks(overflow)
+        assert (
+            manager.allocate_slots(
+                overflow,
+                16,
+                num_new_computed_tokens=local,
+                new_computed_blocks=hits,
+                num_external_computed_tokens=32 - local,
+            )
+            is None
+        )
+        manager.free(overflow)
+        now[0] = 3601
+        assert host.block_pool.expire_idle() == 0
+        retired = min(2, branches - 1)
+        for branch in active[:retired]:
+            manager.free(branch)
+        now[0] += 3600
+        assert host.block_pool.expire_idle() == retired
+        assert all(page.ref_cnt == branches - retired for page in shared)
+        assert all(page.block_hash is not None for page in shared)
+        for branch in active[retired:]:
+            manager.free(branch)
+        assert host.block_pool.get_num_free_blocks() == branches + 2
+        now[0] += 3600
+        assert host.block_pool.expire_idle() == branches - retired + 2
+        assert all(page.ref_cnt == 0 and page.block_hash is None for page in shared)
+        assert manager.get_computed_blocks(request("expired", 400))[1] == 0
+
+    @staticmethod
+    def setup():
+        config = _shared_layout_config()
+        config.model_config.original_max_model_len = 32
+        config.model_config.max_model_len = 32
+        small = _full()
+        large = replace(small, head_size=128, head_size_v=128)
+        groups = [
+            KVCacheGroupSpec(["gpu.0", "gpu.1"], small),
+            KVCacheGroupSpec(
+                ["host.0", "host.1", "host.2"],
+                UniformTypeKVCacheSpecs(
+                    block_size=16,
+                    kv_cache_specs={"host.0": small, "host.1": large, "host.2": small},
+                ),
+                is_eagle_group=True,
+                host_resident=True,
+                enable_kv_transfer=False,
+                role=KVCacheGroupRole.DIRECT_HOST,
+            ),
+        ]
+        workers = [
+            {"gpu.0": small, "host.0": small},
+            {"gpu.1": small, "host.1": large, "host.2": small},
+        ]
+        return config, groups, workers, small
+
+    @staticmethod
+    def enable_startup(config, blocks=7, budget=MEMORY):
+        config.additional_config = {
+            "flash_next_direct_host_kv": {"num_blocks": blocks, "max_bytes": budget}
+        }
+        config.model_config.enforce_eager = True
+        config.parallel_config.data_parallel_size = 1
+
+    def test_model_specs_select_native_planner_and_keep_target_draft_groups_separate(
+        self,
+    ):
+        config, _, workers, small = self.setup()
+        self.enable_startup(config)
+        for worker in workers:
+            for name, spec in list(worker.items()):
+                if name.startswith("host."):
+                    worker[name] = replace_as(
+                        spec, DirectHostAttentionSpec, is_mtp_draft=name == "host.2"
+                    )
+        plans = get_kv_cache_configs(config, workers, [MEMORY, MEMORY // 2])
+        scheduler = generate_scheduler_kv_cache_config(plans)
+        host_groups = [g for g in scheduler.kv_cache_groups if g.host_resident]
+        assert len(host_groups) == 2
+        assert [g.is_eagle_group for g in host_groups] == [False, True]
+        assert all(g.role is KVCacheGroupRole.DIRECT_HOST for g in host_groups)
+        assert all(type(g.kv_cache_spec) is FullAttentionSpec for g in host_groups)
+        assert scheduler.host_num_blocks == 7
+        assert resolve_kv_cache_block_sizes(scheduler, config) == (16, 16)
+        assert all(
+            plan.num_blocks == MEMORY // (2 * small.page_size_bytes) for plan in plans
+        )
+
+    def test_qsa_publishes_real_host_geometry_only_with_explicit_opt_in(self):
+        # Import through model first: model/qsa have an existing circular import.
+        from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpQSAAttention
+
+        config, _, _, _ = self.setup()
+        config.additional_config = {}
+        config.cache_config.block_size = 3504
+        layer = SimpleNamespace(
+            _qsa_kv_offload=True,
+            num_kv_heads=1,
+            head_dim=256,
+            kv_cache_torch_dtype=torch.bfloat16,
+            kv_cache_dtype="auto",
+            _qsa_is_mtp_draft=True,
+        )
+        legacy = Qwen4ExpQSAAttention.get_kv_cache_spec(layer, config)
+        assert type(legacy) is FullAttentionSpec
+        assert legacy.page_size_bytes == 7008
+        self.enable_startup(config)
+        real = Qwen4ExpQSAAttention.get_kv_cache_spec(layer, config)
+        assert isinstance(real, DirectHostAttentionSpec)
+        assert real.is_mtp_draft
+        assert real.block_size == 3504
+        assert real.page_size_bytes == 3588096
+        assert real.num_head_slots is None and real.state_content_bytes is None
+        layer._qsa_kv_offload = False
+        with pytest.raises(ValueError, match="VLLM_QSA_KV_OFFLOAD"):
+            Qwen4ExpQSAAttention.get_kv_cache_spec(layer, config)
+
+    @pytest.mark.parametrize("invalid", ["bool", "extra", "eager", "dp", "hybrid"])
+    def test_startup_rejects_ambiguous_or_unsupported_opt_in(self, invalid):
+        config, _, _, _ = self.setup()
+        self.enable_startup(config)
+        options = config.additional_config["flash_next_direct_host_kv"]
+        if invalid == "bool":
+            options["num_blocks"] = True
+        elif invalid == "extra":
+            options["max_byte"] = MEMORY
+        elif invalid == "eager":
+            config.model_config.enforce_eager = False
+        elif invalid == "dp":
+            config.parallel_config.data_parallel_size = 2
+        else:
+            config.scheduler_config.disable_hybrid_kv_cache_manager = True
+        with pytest.raises(ValueError):
+            get_direct_host_cache_options(config)
+
+    def test_host_groups_cannot_silently_enter_gpu_only_profiling_allocator(self):
+        config, groups, _, _ = self.setup()
+        with pytest.raises(ValueError, match="independent host/device planner"):
+            get_kv_cache_config_from_groups(config, groups, MEMORY)
+
+    def test_opted_in_graphs_keep_the_independent_pool_plan(self):
+        config, _, workers, _ = self.setup()
+        self.enable_startup(config)
+        for worker in workers:
+            for name, spec in list(worker.items()):
+                if name.startswith("host."):
+                    worker[name] = replace_as(spec, DirectHostAttentionSpec)
+        eager = get_kv_cache_configs(config, workers, [MEMORY, MEMORY // 2])
+        config.model_config.enforce_eager = False
+        config.cache_config.kv_cache_memory_bytes = MEMORY
+        config.compilation_config = SimpleNamespace(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+        )
+        config.additional_config["flash_next_direct_host_kv"]["allow_cudagraph"] = True
+        graph = get_kv_cache_configs(config, workers, [MEMORY, MEMORY // 2])
+        assert graph == eager
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            "auto",
+            "zero",
+            "negative",
+            "bool_budget",
+            "override",
+            "compile",
+            "piecewise",
+            "full",
+            "no_graph",
+            "nonbool_opt_in",
+        ],
+    )
+    def test_graph_opt_in_cannot_enter_unsupported_profiling_or_compile_paths(
+        self, invalid
+    ):
+        config, _, _, _ = self.setup()
+        self.enable_startup(config)
+        config.model_config.enforce_eager = False
+        config.cache_config.kv_cache_memory_bytes = MEMORY
+        config.compilation_config = SimpleNamespace(
+            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+        )
+        options = config.additional_config["flash_next_direct_host_kv"]
+        options["allow_cudagraph"] = True
+        if invalid in ("auto", "zero", "negative", "bool_budget", "override"):
+            config.cache_config.kv_cache_memory_bytes = {
+                "auto": None,
+                "zero": 0,
+                "negative": -1,
+                "bool_budget": True,
+                "override": None,
+            }[invalid]
+            config.cache_config.num_gpu_blocks_override = 32
+        elif invalid == "compile":
+            config.compilation_config.mode = CompilationMode.VLLM_COMPILE
+        elif invalid == "nonbool_opt_in":
+            options["allow_cudagraph"] = 1
+        else:
+            config.compilation_config.cudagraph_mode = {
+                "piecewise": CUDAGraphMode.PIECEWISE,
+                "full": CUDAGraphMode.FULL,
+                "no_graph": CUDAGraphMode.NONE,
+            }[invalid]
+        with pytest.raises(ValueError):
+            get_direct_host_cache_options(config)
+
+    def test_aligned_ring_replay_is_excluded_from_native_cpu_offload(self):
+        from vllm.models.qwen4_exp.common.qsa_cache import QSAKeyStateCache
+
+        config, _, _, small = self.setup()
+        self.enable_startup(config)
+        config.num_speculative_tokens = 2
+        config.attention_config.resolve_indexer_kv_dtype.return_value = "bf16"
+        config.cache_config.enable_prefix_caching = True
+        config.model_config.use_mla = False
+        config.use_v2_model_runner = True
+        config.kv_transfer_config = SimpleNamespace(
+            engine_id="ring-replay-test", kv_connector_extra_config={}
+        )
+        owner = SimpleNamespace(
+            compress_ratio=4,
+            cache_config=config.cache_config,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        ring = QSAKeyStateCache.get_kv_cache_spec(owner, config)
+        assert ring.replay_alignment == 4 and ring.block_size == 8
+        assert not ring.prefix_cacheable
+        specs = {
+            "qsa": replace_as(small, DirectHostAttentionSpec),
+            "compressed": MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                tokens_per_state=4,
+            ),
+            "ring": ring,
+            "gdn": MambaSpec(
+                block_size=16,
+                shapes=((2, 4), (2, 2, 4)),
+                dtypes=(torch.bfloat16, torch.float32),
+                mamba_cache_mode="align",
+                num_speculative_blocks=2,
+            ),
+        }
+        plans = get_kv_cache_configs(config, [specs], [MEMORY])
+        scheduler = generate_scheduler_kv_cache_config(plans)
+        selected = get_offloading_group_ids(scheduler)
+        names = {
+            name for i in selected for name in scheduler.kv_cache_groups[i].layer_names
+        }
+        assert names == {"compressed", "gdn"}
+        offload = build_offloading_config(config, scheduler)
+        assert {group.group_id for group in offload.groups} == set(selected)
+        assert offload.cache.tokens_per_hash == 16
+        assert offload.extra_config["idle_ttl_seconds"] == 3600
+        original_extra = config.kv_transfer_config.kv_connector_extra_config
+        assert "idle_ttl_seconds" not in original_extra
+        original_extra["idle_ttl_seconds"] = 120
+        assert (
+            build_offloading_config(config, scheduler).extra_config["idle_ttl_seconds"]
+            == 120
+        )
+        for i in selected:
+            get_sliding_window_size_in_chunks(
+                scheduler.kv_cache_groups[i].kv_cache_spec, 16
+            )
+        # Fine-grained Mamba hits must not expose a mid-compression prefix.
+        # Remove compressed-K so this exercises the ring's own guard, not the
+        # existing tokens_per_state guard of the compressed cache.
+        ring_only_guard = replace(
+            scheduler,
+            kv_cache_groups=[
+                group
+                for group in scheduler.kv_cache_groups
+                if "compressed" not in group.layer_names
+            ],
+        )
+        config.cache_config.prefix_match_unit = 2
+        with pytest.raises(ValueError, match="per-state compression"):
+            resolve_kv_cache_block_sizes(ring_only_guard, config)
+
+    def test_unqualified_ring_remains_on_legacy_path_and_cannot_merge_with_replay_ring(
+        self,
+    ):
+        _, groups, _, small = self.setup()
+        ordinary = CircularBufferSpec(
+            block_size=8, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+        )
+        replay = replace(ordinary, replay_alignment=4)
+        assert (
+            UniformTypeKVCacheSpecs.from_specs({"old": ordinary, "new": replay}) is None
+        )
+        assert (
+            UniformTypeKVCacheSpecs.from_specs({"new": replay, "old": ordinary}) is None
+        )
+        # Unqualified circular state must not be silently omitted from transfers.
+        from vllm.v1.kv_cache_interface import KVCacheConfig
+
+        cache = KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["ordinary"], ordinary),
+                KVCacheGroupSpec(["replay"], replay),
+                KVCacheGroupSpec(["gpu"], small),
+                groups[1],
+            ],
+        )
+        assert get_offloading_group_ids(cache) == (0, 2)
+
+    @pytest.mark.parametrize("alignment", [0, 3, True])
+    def test_invalid_ring_replay_alignment_is_rejected(self, alignment):
+        with pytest.raises(ValueError, match="Ring replay alignment"):
+            CircularBufferSpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                replay_alignment=alignment,
+            )
+
+    def test_projection_preserves_pool_and_transfer_roles_even_on_empty_stage(self):
+        _, groups, workers, small = self.setup()
+        for owned in (*workers, {"gpu.0": small}):
+            projected = _project_kv_cache_groups_to_worker(groups, owned)
+            host = projected[1]
+            assert host.host_resident
+            assert host.role is KVCacheGroupRole.DIRECT_HOST
+            assert not host.enable_kv_transfer
+            assert host.is_eagle_group == bool(host.layer_names)
+        assert groups[1].layer_names == ["host.0", "host.1", "host.2"]
+
+    def test_tp2_pp2_normalizes_device_capacity_without_shrinking_host_pages(self):
+        config, groups, stages, small = self.setup()
+        page = small.page_size_bytes
+        # Both TP ranks of each PP stage consume their own pinned backing.
+        workers = [stages[0], stages[0], stages[1], stages[1]]
+        plans = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            workers,
+            [10 * page, 9 * page, 6 * page, 5 * page],
+            host_num_blocks=7,
+            host_max_bytes=80 * page,
+        )
+        assert [plan.num_blocks for plan in plans] == [5] * 4
+        assert [plan.direct_host_num_blocks for plan in plans] == [7] * 4
+        assert [plan.direct_host_idle_ttl_seconds for plan in plans] == [3600] * 4
+        assert [plan.direct_host_max_bytes for plan in plans] == [
+            8 * page,
+            8 * page,
+            32 * page,
+            32 * page,
+        ]
+        for plan, owned in zip(plans, workers):
+            assert {name for t in plan.kv_cache_tensors for name in t.layers} == set(
+                owned
+            )
+            assert {t.size for t in plan.kv_cache_tensors if not t.host_resident} == {
+                5 * page
+            }
+            host_pages = sum(
+                spec.page_size_bytes
+                for name, spec in owned.items()
+                if name.startswith("host.")
+            )
+            assert {t.size for t in plan.kv_cache_tensors if t.host_resident} == {
+                7 * host_pages
+            }
+            host_tensors = [t for t in plan.kv_cache_tensors if t.host_resident]
+            assert all(t.block_stride == host_pages for t in host_tensors)
+        scheduler = generate_scheduler_kv_cache_config(plans)
+        assert scheduler.host_num_blocks == 7
+        assert scheduler.kv_cache_groups[1].host_resident
+
+    @pytest.mark.parametrize("ttl", [None, 120.5, 3600])
+    def test_host_idle_lifetime_reaches_every_worker_and_native_pool(self, ttl):
+        config, groups, stages, small = self.setup()
+        config.kv_transfer_config = SimpleNamespace(
+            kv_connector_extra_config={"idle_ttl_seconds": ttl}
+        )
+        plans = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            stages,
+            [MEMORY] * 2,
+            host_num_blocks=7,
+            host_max_bytes=MEMORY,
+        )
+        assert all(plan.direct_host_idle_ttl_seconds == ttl for plan in plans)
+        scheduler = generate_scheduler_kv_cache_config(plans)
+        manager = KVCacheManager(
+            scheduler,
+            max_model_len=32,
+            enable_caching=True,
+            hash_block_size=16,
+            scheduler_block_size=16,
+        )
+        host = manager.coordinator.single_type_managers[1].block_pool
+        assert host.idle_ttl_seconds == ttl
+        assert host is not manager.block_pool
+
+    def test_total_budget_counts_tp_copies_and_pinned_allocator_rounding(self):
+        config, groups, workers, small = self.setup()
+        page = small.page_size_bytes
+        # Logical size is 28 pages, but rounded reservations need 40 pages.
+        with pytest.raises(ValueError, match="total RAM budget"):
+            get_direct_host_kv_cache_configs(
+                config,
+                groups,
+                workers,
+                [10 * page] * 2,
+                host_num_blocks=7,
+                host_max_bytes=40 * page - 1,
+            )
+
+    def test_tp4_target_draft_geometry_fits_non_power_of_two_host_capacity(self):
+        """Plan measured QSA page geometry without allocating large tensors."""
+        config, _, _, small = self.setup()
+        config.model_config.original_max_model_len = 240000
+        config.model_config.max_model_len = 240000
+        page = FullAttentionSpec(
+            block_size=944, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
+        )
+        assert page.page_size_bytes == 966656
+        groups = [KVCacheGroupSpec(["gpu"], small)]
+        workers = {"gpu": small}
+        for name, layers in (("target", 12), ("draft", 1)):
+            names = [f"{name}.{i}" for i in range(layers)]
+            workers.update(dict.fromkeys(names, page))
+            groups.append(
+                KVCacheGroupSpec(
+                    names,
+                    page,
+                    is_eagle_group=name == "draft",
+                    host_resident=True,
+                    enable_kv_transfer=False,
+                    role=KVCacheGroupRole.DIRECT_HOST,
+                )
+            )
+        plans = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            [workers] * 4,
+            [1024**3] * 4,
+            host_num_blocks=2560,
+            host_max_bytes=128 * 1024**3,
+        )
+        assert [plan.direct_host_max_bytes for plan in plans] == [32 * 1024**3] * 4
+        for plan in plans:
+            host = [t for t in plan.kv_cache_tensors if t.host_resident]
+            assert {t.size for t in host} == {2560 * 12 * page.page_size_bytes}
+            assert {t.block_stride for t in host} == {12 * page.page_size_bytes}
+        with pytest.raises(ValueError, match="total RAM budget"):
+            get_direct_host_kv_cache_configs(
+                config,
+                groups,
+                [workers] * 4,
+                [1024**3] * 4,
+                host_num_blocks=4096,
+                host_max_bytes=128 * 1024**3,
+            )
+
+    def test_planned_host_views_do_not_alias_owned_layers_or_device_backing(self):
+        config, groups, workers, _ = self.setup()
+        plan = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            workers,
+            [MEMORY] * 2,
+            host_num_blocks=7,
+            host_max_bytes=MEMORY,
+        )[1]
+        # CPU layout test only; pinned UVA binding has a separate GPU probe.
+        device_views, host_views = [
+            _allocate_kv_cache(
+                replace(
+                    plan,
+                    kv_cache_tensors=[
+                        t for t in plan.kv_cache_tensors if t.host_resident == host
+                    ],
+                ),
+                torch.device("cpu"),
+                KVCacheLayout.BLNHC,
+            )
+            for host in (False, True)
+        ]
+        assert set(host_views) == {"host.1", "host.2"}
+        device_views["gpu.1"].fill_(11)
+        host_views["host.1"].fill_(22)
+        host_views["host.2"].fill_(33)
+        for name, value in (("host.1", 22), ("host.2", 33)):
+            assert host_views[name].shape[0] == 7
+            assert torch.all(host_views[name] == value)
+        assert torch.all(device_views["gpu.1"] == 11)
+        assert host_views["host.1"].untyped_storage().data_ptr() == (
+            host_views["host.2"].untyped_storage().data_ptr()
+        )
+        assert host_views["host.1"].untyped_storage().data_ptr() != (
+            device_views["gpu.1"].untyped_storage().data_ptr()
+        )
+
+    def test_empty_host_or_device_stage_keeps_shared_ids_without_unused_allocations(
+        self,
+    ):
+        config, groups, workers, small = self.setup()
+        workers = [{"gpu.0": small}, {"host.0": small}]
+        plans = get_direct_host_kv_cache_configs(
+            config,
+            groups,
+            workers,
+            [8 * small.page_size_bytes, 0],
+            host_num_blocks=7,
+            host_max_bytes=8 * small.page_size_bytes,
+        )
+        assert [plan.num_blocks for plan in plans] == [8, 8]
+        assert plans[0].direct_host_max_bytes == 0
+        assert all(not t.host_resident for t in plans[0].kv_cache_tensors)
+        assert all(t.host_resident for t in plans[1].kv_cache_tensors)
+        assert plans[0].kv_cache_groups[1].role is KVCacheGroupRole.DIRECT_HOST
+        assert plans[0].kv_cache_groups[1].layer_names == []
+        scheduler = generate_scheduler_kv_cache_config(plans)
+        assert scheduler.kv_cache_groups[1].is_eagle_group
+        assert not plans[0].kv_cache_groups[1].is_eagle_group
+
+    @pytest.mark.parametrize(
+        "failure", ["capacity", "placeholder", "coverage", "roles"]
+    )
+    def test_invalid_host_plan_is_rejected_before_any_allocation(self, failure):
+        config, groups, workers, small = self.setup()
+        blocks = 7
+        match = ""
+        if failure == "capacity":
+            blocks, match = 2, "null block"
+        elif failure == "placeholder":
+            groups[1].kv_cache_spec = replace(
+                small, num_head_slots=1, state_content_bytes=2
+            )
+            match = "real full-attention"
+        elif failure == "coverage":
+            workers[0]["unassigned"] = small
+            match = "exactly one"
+        else:
+            groups[1].role = KVCacheGroupRole.DEFAULT
+            match = "consistent host group roles"
+        with pytest.raises(ValueError, match=match):
+            get_direct_host_kv_cache_configs(
+                config,
+                groups,
+                workers,
+                [MEMORY] * 2,
+                host_num_blocks=blocks,
+                host_max_bytes=MEMORY,
+            )
 
 
 class TestCSALinearGrouping:

@@ -29,11 +29,13 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
+    DirectHostAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     HiSparseHotSpec,
     KpoolTailSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheSpec,
@@ -44,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
+    get_direct_host_cache_options,
     iter_layer_specs,
     replace_as,
 )
@@ -787,6 +790,12 @@ def resolve_kv_cache_block_sizes(
         and isinstance(spec.tokens_per_state, int)
         and spec.tokens_per_state > 1
     }
+    prefix_alignments.update(
+        spec.replay_alignment
+        for group in groups
+        for spec in iter_layer_specs(group.kv_cache_spec)
+        if isinstance(spec, CircularBufferSpec) and spec.replay_alignment is not None
+    )
     has_partial_mamba_group = any(
         isinstance(spec, MambaSpec)
         and spec.mamba_cache_mode == "align"
@@ -1091,12 +1100,14 @@ def get_max_concurrency_for_kv_cache_config(
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    limits = (
+        [kv_cache_config.num_blocks / num_blocks_per_request]
+        if num_blocks_per_request
+        else []
+    )
     if host_blocks_per_request:
-        assert kv_cache_config.hisparse_host_num_blocks is not None
-        limits.append(
-            kv_cache_config.hisparse_host_num_blocks / host_blocks_per_request
-        )
+        assert kv_cache_config.host_num_blocks is not None
+        limits.append(kv_cache_config.host_num_blocks / host_blocks_per_request)
     return min(limits)
 
 
@@ -1661,6 +1672,10 @@ def get_kv_cache_config_from_groups(
     Returns:
         The generated KVCacheConfig
     """
+    if any(group.role is KVCacheGroupRole.DIRECT_HOST for group in kv_cache_groups):
+        raise ValueError(
+            "Direct host groups require the independent host/device planner"
+        )
     if len(kv_cache_groups) == 0:
         # Attention free models do not have KV cache.
         # Return num_blocks=1 as BlockPool always needs a null_block.
@@ -1745,10 +1760,31 @@ def get_kv_cache_config_from_groups(
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
-    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
-
     num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=_build_packed_kv_cache_tensors(
+            kv_cache_groups, num_blocks, layout
+        ),
+        kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+    )
+
+
+def _build_packed_kv_cache_tensors(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    num_blocks: int,
+    layout: KVCacheLayout,
+) -> list[KVCacheTensor]:
+    """Plan one backing pool, retaining only layers owned by this worker."""
+    if not any(group.layer_names for group in kv_cache_groups):
+        return []
+    validate_kv_cache_layout(layout, kv_cache_groups)
+    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
     size = bytes_per_block * num_blocks
 
     # Groups alias from byte 0. Spec regions are laid out differently:
@@ -1801,14 +1837,7 @@ def get_kv_cache_config_from_groups(
             )
             byte_offset += len(layer_names) * spec.page_size_bytes
 
-    return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=kv_cache_tensors,
-        kv_cache_groups=kv_cache_groups,
-        prefix_cache_retention_interval=(
-            vllm_config.cache_config.prefix_cache_retention_interval
-        ),
-    )
+    return kv_cache_tensors
 
 
 def _promote_local_kv_cache_specs(
@@ -2245,6 +2274,46 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    host_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, DirectHostAttentionSpec)
+    }
+    if host_specs:
+        if get_direct_host_cache_options(vllm_config) is None:
+            raise ValueError("Direct host specs require an explicit host-pool budget")
+        if vllm_config.attention_config.hisparse_config is not None:
+            raise ValueError("Direct host KV cannot use a HiSparse layout")
+        device_specs = {
+            name: spec for name, spec in kv_cache_spec.items() if name not in host_specs
+        }
+        groups = get_kv_cache_groups(vllm_config, device_specs)
+        kv_cache_spec.update(device_specs)
+        # Target and draft checkpoints have different replay boundaries.
+        for is_draft in (False, True):
+            specs = {
+                name: replace_as(spec, FullAttentionSpec, drop=("is_mtp_draft",))
+                for name, spec in host_specs.items()
+                if spec.is_mtp_draft == is_draft
+            }
+            if not specs:
+                continue
+            uniform = UniformTypeKVCacheSpecs.from_specs(specs)
+            if uniform is None:
+                raise ValueError(
+                    "Direct host QSA layers require uniform token geometry"
+                )
+            groups.append(
+                KVCacheGroupSpec(
+                    list(specs),
+                    uniform,
+                    is_eagle_group=is_draft,
+                    host_resident=True,
+                    role=KVCacheGroupRole.DIRECT_HOST,
+                )
+            )
+        return groups
+
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
@@ -2337,10 +2406,30 @@ def generate_scheduler_kv_cache_config(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
         for cfg in kv_cache_configs
     )
+    assert all(
+        cfg.direct_host_num_blocks == kv_cache_configs[0].direct_host_num_blocks
+        for cfg in kv_cache_configs
+    )
+    assert all(
+        cfg.direct_host_idle_ttl_seconds
+        == kv_cache_configs[0].direct_host_idle_ttl_seconds
+        for cfg in kv_cache_configs
+    )
+    assert all(
+        cfg.direct_host_offload_bytes_per_block
+        == kv_cache_configs[0].direct_host_offload_bytes_per_block
+        for cfg in kv_cache_configs
+    )
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
-    for group in cfg.kv_cache_groups:
+    for group_id, group in enumerate(cfg.kv_cache_groups):
+        # PP projection clears this flag on stages without draft layers. The
+        # scheduler owns all stages, so it must retain the global draft role.
+        group.is_eagle_group = any(
+            worker.kv_cache_groups[group_id].is_eagle_group
+            for worker in kv_cache_configs
+        )
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
             # so use an arbitrary one to initialize the scheduler.
@@ -2583,13 +2672,179 @@ def _project_kv_cache_groups_to_worker(
                 },
             )
         projected_groups.append(
-            KVCacheGroupSpec(
-                worker_layer_names,
-                group_spec,
+            replace(
+                group,
+                layer_names=worker_layer_names,
+                kv_cache_spec=group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
             )
         )
     return projected_groups
+
+
+def get_direct_host_kv_cache_configs(
+    vllm_config: VllmConfig,
+    global_groups: list[KVCacheGroupSpec],
+    worker_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+    *,
+    host_num_blocks: int,
+    host_max_bytes: int,
+) -> list[KVCacheConfig]:
+    """Plan independent resident-host/device pools across TP/PP workers.
+
+    The caller supplies globally grouped real host pages, not GPU placeholder
+    specs. ``host_max_bytes`` bounds the sum of rounded pinned allocations over
+    all supplied workers; ``available_memory`` contains device budgets only.
+    This does not enable model prefix reuse or resolve checkpoint semantics.
+    """
+    if not worker_specs or len(worker_specs) != len(available_memory):
+        raise ValueError("Direct host planning needs one budget per worker")
+    if host_num_blocks < 2 or host_max_bytes <= 0:
+        raise ValueError("Direct host planning needs usable capacity and a RAM budget")
+    if vllm_config.attention_config.hisparse_config is not None:
+        raise ValueError("Direct host KV cannot use a HiSparse layout")
+    if vllm_config.model_config.original_max_model_len == -1:
+        raise ValueError("Direct host planning requires an explicit max_model_len")
+    host_groups = [group for group in global_groups if group.host_resident]
+    if not host_groups or any(
+        group.host_resident != (group.role is KVCacheGroupRole.DIRECT_HOST)
+        for group in global_groups
+    ):
+        raise ValueError("Direct host planning requires consistent host group roles")
+    for group in host_groups:
+        for spec in iter_layer_specs(group.kv_cache_spec):
+            if (
+                type(spec) is not FullAttentionSpec
+                or spec.num_head_slots is not None
+                or spec.state_content_bytes is not None
+            ):
+                raise ValueError(
+                    "Direct host planning requires real full-attention pages"
+                )
+    required_host_blocks = sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in host_groups
+    )
+    if required_host_blocks > host_num_blocks - 1:
+        raise ValueError(
+            "Direct host pool cannot fit max_model_len plus its null block"
+        )
+
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    transfer_config = vllm_config.kv_transfer_config
+    idle_ttl = (
+        transfer_config.kv_connector_extra_config.get("idle_ttl_seconds", 3600)
+        if transfer_config is not None
+        else 3600
+    )
+    configs = []
+    device_configs = []
+    for worker_spec, memory in zip(worker_specs, available_memory):
+        groups = _project_kv_cache_groups_to_worker(global_groups, worker_spec)
+        owned = [name for group in groups for name in group.layer_names]
+        if set(owned) != set(worker_spec) or len(owned) != len(worker_spec):
+            raise ValueError(
+                "Every worker layer must belong to exactly one cache group"
+            )
+        device_groups = [group for group in groups if not group.host_resident]
+        if not any(group.layer_names for group in device_groups):
+            device_groups = []
+        if device_groups:
+            stride = _pool_bytes_per_block(device_groups)
+            override = vllm_config.cache_config.num_gpu_blocks_override
+            effective_memory = memory if override is None else override * stride
+            _check_enough_kv_cache_memory(
+                effective_memory - stride,
+                partial(
+                    _max_memory_usage_bytes_from_groups, vllm_config, device_groups
+                ),
+                vllm_config.model_config.max_model_len,
+                partial(
+                    _estimate_max_model_len_from_groups, vllm_config, device_groups
+                ),
+            )
+        device = get_kv_cache_config_from_groups(vllm_config, device_groups, memory)
+        device_configs.append(device)
+        host_tensors = [
+            replace(tensor, host_resident=True)
+            for tensor in _build_packed_kv_cache_tensors(
+                [group for group in groups if group.host_resident],
+                host_num_blocks,
+                layout,
+            )
+        ]
+        size = host_tensors[0].size if host_tensors else 0
+        reserved = 1 << (size - 1).bit_length() if size else 0
+        configs.append(
+            replace(
+                device,
+                kv_cache_groups=groups,
+                kv_cache_tensors=device.kv_cache_tensors + host_tensors,
+                direct_host_num_blocks=host_num_blocks,
+                direct_host_max_bytes=reserved,
+                direct_host_idle_ttl_seconds=idle_ttl,
+            )
+        )
+    if sum(config.direct_host_max_bytes or 0 for config in configs) > host_max_bytes:
+        raise ValueError("Direct host pinned allocations exceed the total RAM budget")
+
+    # A physical GPU block has one owner even when groups alias its bytes.
+    # Reuse native whole-block transfers for proven block-outer layouts.
+    for config, device in zip(configs, device_configs):
+        if not layout.is_block_outermost or not device.kv_cache_tensors:
+            continue
+        stride = device.kv_cache_tensors[0].size // device.num_blocks
+        if all(
+            spec.has_layer_views or spec.page_size_bytes == stride
+            for group in device.kv_cache_groups
+            if group.layer_names
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        ):
+            config.direct_host_offload_packed_stride = stride
+
+    # Native CPU mmap rows must have identical width on every PP/TP rank.
+    # Unqualified layouts retain their conservative per-layer bound.
+    offload_bytes = max(
+        config.direct_host_offload_packed_stride
+        or sum(
+            sum(spec.page_size_bytes for spec in iter_layer_specs(group.kv_cache_spec))
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in config.kv_cache_groups
+            if group.layer_names
+            and not group.host_resident
+            and not all(
+                isinstance(spec, CircularBufferSpec)
+                and spec.replay_alignment is not None
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            )
+        )
+        for config in configs
+    )
+    for config in configs:
+        config.direct_host_offload_bytes_per_block = offload_bytes
+
+    # A stage without device layers must not cap the other stages at one block.
+    num_blocks = min(
+        (config.num_blocks for config in device_configs if config.kv_cache_tensors),
+        default=1,
+    )
+    for config, device in zip(configs, device_configs):
+        if device.num_blocks != num_blocks and device.kv_cache_tensors:
+            device = get_kv_cache_config_from_groups(
+                vllm_config,
+                device.kv_cache_groups,
+                num_blocks * _pool_bytes_per_block(device.kv_cache_groups),
+            )
+        config.num_blocks = num_blocks
+        config.kv_cache_tensors = device.kv_cache_tensors + [
+            tensor for tensor in config.kv_cache_tensors if tensor.host_resident
+        ]
+    return configs
 
 
 def get_kv_cache_configs(
@@ -2663,6 +2918,17 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+
+    if (host_options := get_direct_host_cache_options(vllm_config)) is not None:
+        host_num_blocks, host_max_bytes = host_options
+        return get_direct_host_kv_cache_configs(
+            vllm_config,
+            global_kv_cache_groups,
+            kv_cache_specs,
+            available_memory,
+            host_num_blocks=host_num_blocks,
+            host_max_bytes=host_max_bytes,
+        )
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.

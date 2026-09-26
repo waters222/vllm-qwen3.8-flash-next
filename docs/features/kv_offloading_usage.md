@@ -72,9 +72,11 @@ vllm serve <model> \
 | --- | --- | --- | --- | --- |
 | `spec_name` | no | `CPUOffloadingSpec` | both | Set to `TieringOffloadingSpec` for multi-tier. |
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
+| `use_shared_memory` | no | `true` | single-tier | Experimental explicit selection: `false` uses the existing per-worker pinned-tensor allocation instead of shared mmap on CUDA/ROCm. Native transfer handlers and eviction are unchanged. Private buffers disable shared-layout deduplication; the CPU budget still covers all workers. This is not an automatic fallback after registration failure. |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |
 | `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). |
+| `idle_ttl_seconds` | no | `null` | single-tier | Experimental in this fork. A finite positive number expires unreferenced CPU chunks after that many idle seconds; `null` disables expiry. Direct-host QSA configuration defaults this option to `3600` unless explicitly overridden. See [Idle expiry](#idle-expiry-experimental). |
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
@@ -82,6 +84,43 @@ vllm serve <model> \
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
+
+## Idle Expiry (Experimental)
+
+Set `"idle_ttl_seconds": 3600` in `kv_connector_extra_config` for a 60-minute
+idle lifetime. This is a per-cache-entry lifetime, not a session lease. Native
+LRU can evict an idle entry earlier when capacity is needed. Shared prefixes
+can outlive one conversation because another request still uses them.
+
+Expiry is lazy: cache operations and statistics collection check deadlines;
+there is no background timer promising removal at exactly 60 minutes.
+Prepared loads and pending stores hold references that prevent expiry. Native
+cache touches and completion of the last transfer refresh the idle deadline.
+An expired entry becomes a miss; the request must supply its prompt so the
+engine can recompute it. Expiry neither wipes old bytes nor releases the
+preallocated pinned-memory reservation to the operating system.
+
+The native metrics `vllm:external_prefix_cache_queries` and
+`vllm:external_prefix_cache_hits` count connector lookup tokens, while
+`vllm:kv_offload_load_bytes` records transfers. These are aggregate metrics,
+not per-request attribution under concurrency. The counter
+`vllm:kv_offload_cpu_cache_expired_chunks` records CPU-offload TTL removals;
+it does not count capacity evictions or expiry in the separate resident-QSA
+RAM pool. Native cache-removal events are emitted when events are enabled.
+
+`vllm:kv_offload_cpu_cache_usage_perc` measures the fraction of CPU chunks
+currently pinned by transfers, not all retained cache entries or host RSS.
+Its read/write gauges split in-flight loads and stores. A zero value can coexist
+with a populated idle cache and its full pinned-memory reservation. Prometheus
+exports counters with its usual `_total` suffix; hit/query counters count
+tokens, not requests or bytes. Do not sum local and external hit ratios.
+
+The separate QSA RAM pool uses the same configured TTL but retains its own
+capacity and references. Both tiers must retain compatible state for a cold
+hit. A larger CPU-offload budget cannot compensate for missing QSA RAM pages.
+See the [Flash-Next qualification record](../flash_next/session-swap.md) for
+the current experimental limitations; this option is not a production
+qualification claim.
 
 ## Custom Eviction Policies
 

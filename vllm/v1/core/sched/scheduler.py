@@ -219,6 +219,7 @@ class Scheduler(SchedulerInterface):
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
+        self.flash_session_transactions = None
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -622,6 +623,16 @@ class Scheduler(SchedulerInterface):
             if input_budget <= draft_slots:
                 break
 
+            retained_stream = (
+                self.flash_session_transactions is not None and request.resumable
+            )
+            if retained_stream and request.num_in_flight_tokens:
+                # A prior result can end this input turn. Another forward could
+                # advance its recurrent state and deliver a second stop after
+                # the session is already idle or has received its next input.
+                req_index += 1
+                continue
+
             if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
@@ -671,6 +682,15 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            if (
+                retained_stream
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                # Unlike a disposable completed request, an idle session must
+                # retain state no further than the returned turn's boundary.
+                num_new_tokens = min(
+                    num_new_tokens, request.max_tokens - request.num_output_tokens
+                )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -2512,6 +2532,19 @@ class Scheduler(SchedulerInterface):
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
+            if existing.status == RequestStatus.WAITING_FOR_COLD_SESSION:
+                if (
+                    existing.client_index != request.client_index
+                    or existing.streaming_queue is None
+                ):
+                    raise ValueError("cold session identity or streaming mode mismatch")
+                if update is None:
+                    self.finish_requests(
+                        request.request_id, RequestStatus.FINISHED_ABORTED
+                    )
+                else:
+                    existing.streaming_queue.append(update)
+                return
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
                 assert existing.streaming_queue is not None, "duplicate request id"
                 # Queue next input chunk (or finished sentinel).
@@ -2568,6 +2601,9 @@ class Scheduler(SchedulerInterface):
             if request is None or request.is_finished():
                 # Invalid request ID.
                 continue
+
+            if self.flash_session_transactions is not None:
+                self.flash_session_transactions.cancel(req_id)
 
             valid_requests.append(request)
             if request.status == RequestStatus.RUNNING:

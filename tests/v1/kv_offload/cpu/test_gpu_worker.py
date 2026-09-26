@@ -37,6 +37,28 @@ NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
 
 
+@pytest.mark.parametrize("status", [0, 1, 2])
+def test_mmap_registration_failure_prevents_unpinned_uva(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """A failed registration must not permit GPU access to pageable host KV."""
+    region = MagicMock(rank=2, total_size_bytes=8192, is_pinned=False)
+    region._base.data_ptr.return_value = 4096
+    runtime = MagicMock()
+    runtime.cudaHostRegister.return_value.value = status
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+
+    if status:
+        with pytest.raises(RuntimeError, match=f"rank=2 bytes=8192 code={status}"):
+            gpu_worker.pin_mmap_region(region)
+        assert not region.is_pinned
+    else:
+        gpu_worker.pin_mmap_region(region)
+        assert region.is_pinned
+    runtime.cudaHostRegister.assert_called_once_with(4096, 8192, 0)
+
+
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")
 def test_rocm_cpu_to_gpu_uses_dma(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_worker, "HAS_TRITON", True)

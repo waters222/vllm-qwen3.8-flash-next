@@ -1,5 +1,13 @@
 # Flash-Next: preserved RTX 3090 engine modifications
 
+Latest development results: [TP4 image inputs with MTP4](image-mtp-benchmark.md)
+records the completed September 26 C2/C4 matrix, including four images per
+request and 1,024 output tokens. Image support required configuration changes,
+not an additional image-specific engine patch, on the existing modified runtime.
+This does not imply unmodified upstream support or numerical/cache qualification.
+The [accumulated development update](development-update-20260926.md) describes
+the cache changes, TP4 kernels, regression fixes and disabled experiments.
+
 This branch preserves the engine source used by a qualified four-GPU
 Qwen3.8-Flash-Next evaluation on 2026-09-20. It is **not** an upstream vLLM
 release, a generic deployment preset, or a newly rebuilt/validated image.
@@ -34,6 +42,27 @@ depth3 also passed C1 context checks through32K. Intermittent C1 timing
 variation remains unresolved; this is not a production promotion or240K test.
 Revised source files are tracked separately from the original image hashes;
 the byte-for-byte preservation statements below describe the snapshot.
+
+## Experimental native hot/cold prefix cache
+
+The current worktree also contains [native hot/cold prefix-cache integration
+and its qualification record](session-swap.md). Ordinary independent requests
+reuse vLLM prefix hashes, references, eviction and CPU-offload jobs. Target/MTP
+main QSA KV stays in an independently owned resident-RAM pool; native CPU
+offload retains the reusable GPU-side state. Idle expiry is 3600 seconds in
+the tested configuration, with LRU allowed to evict earlier under pressure.
+This is not the historical streaming-session prototype, which remains disabled.
+
+Full-model TP4/MTP4 testing has byte/ownership evidence through 32k context;
+larger retention budgets have CPU planner/allocator evidence only. Generated
+output variability is evaluated separately from cache integrity. Performance,
+broader qualification and human review remain incomplete. The feature is
+opt-in, is running only in an experimental test provision, and does not make the historical
+image or performance tables below representative of the new cache path.
+
+The current source manifest/export covers 73 engine files. Original snapshot
+hashes and documented post-snapshot revisions remain distinct. Model weights,
+compiled binaries and site-specific credentials must not enter the build context.
 
 ## Provenance
 
@@ -121,22 +150,27 @@ kernel gains must not be equated with the same gain at request concurrency C.
 
 ## CPU preservation checks
 
-Use a dedicated environment. These checks require no torch, CUDA or model
-weights and do not claim GPU numerical or performance qualification:
+Use a dedicated environment. The source-preservation and build-context checks
+require no torch, CUDA or model weights and do not claim GPU qualification:
 
 ```bash
 uv venv --python 3.12
 uv pip install -r requirements/lint.txt
 .venv/bin/pre-commit install
-.venv/bin/python tools/flash_next/run_cpu_tests.py
+PYTHONPATH=tools/flash_next .venv/bin/python -m unittest discover \
+  -s tests/flash_next -p test_source_preservation.py
+PYTHONPATH=tools/flash_next .venv/bin/python -m unittest discover \
+  -s tests/flash_next -p test_build_context.py
 ```
 
-The suite preserves existing PP admission/vocabulary and Marlin work-partition
-tests, checks all 40 installed source hashes and Python syntax, regenerates
-both qualified CUDA sources from pinned upstream input, and checks the
-allowlisted Docker build context. GPU integration and broader trajectory
-tests remain in the deployment/development repository; they were not copied
-wholesale because they contain site-specific orchestration and fixtures.
+The checks validate all 73 current engine source hashes and Python syntax,
+regenerate the preserved CUDA sources from pinned upstream input, and check
+the allowlisted Docker build context. In an environment with torch installed,
+`tools/flash_next/run_cpu_tests.py` runs the broader CPU suite, including
+existing PP admission/vocabulary, Marlin work-partition and cache tests.
+Some native tests additionally require installed engine dependencies and report
+skips when unavailable; a skipped test is not qualification evidence. GPU
+screens and site-specific orchestration remain separate from these CPU checks.
 
 Migration checks on 2026-09-20 passed all 21 CPU tests and Ruff checks for
 the new exporter, test runner and CPU tests. The local credential scan found
@@ -160,8 +194,9 @@ docker build --network=none --pull=false \
 ```
 
 Fetch the pinned base separately if absent. Compilation requires no GPUs,
-model mounts or network. The exporter includes only 40 engine files, nine
-upstream CUDA/header inputs, two pinned builders and the Dockerfile. It does
+model mounts or network. The current exporter includes 73 engine files, nine
+upstream CUDA/header inputs, three pinned builders and the Dockerfile (86
+files total). It does
 not send `.git`, `.venv`, credentials or the complete repository to Docker.
 
 The custom extension sources are also retained at

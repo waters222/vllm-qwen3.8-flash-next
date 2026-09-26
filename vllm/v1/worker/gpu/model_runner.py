@@ -116,6 +116,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.gpu.flash_session_worker import init_flash_session_worker
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -757,6 +758,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        self.flash_session_worker = (
+            None if is_profiling else init_flash_session_worker(self, kv_caches_dict)
+        )
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -770,6 +774,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
             num_blocks=self.kv_cache_config.num_blocks,
+            host_group_ids=self.kv_cache_config.host_group_ids,
         )
 
     @torch.inference_mode()
@@ -1117,6 +1122,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
+            session_worker = getattr(self, "flash_session_worker", None)
+            if session_worker is not None:
+                session_worker.prepare_streaming_update(new_req_data)
             self._remove_request(req_id)
 
             prompt_len = new_req_data.prompt_len

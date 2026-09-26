@@ -1,0 +1,71 @@
+{
+  "model": "/model",
+  "served_model_name": "Qwen3.8-Flash-Next",
+  "language_model_only": false,
+  "tensor_parallel_size": 4,
+  "pipeline_parallel_size": 1,
+  "engram_config": {
+    "cpu_offload": true
+  },
+  "max_model_len": 32768,
+  "max_num_seqs": 4,
+  "max_num_batched_tokens": 2048,
+  "gpu_memory_utilization": 0.92,
+  "enable_prefix_caching": true,
+  "compilation_config": {
+    "mode": 0,
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "cudagraph_capture_sizes": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      8,
+      10,
+      15,
+      20
+    ]
+  },
+  "kv_cache_memory_bytes": 939524096,
+  "mamba_cache_mode": "align",
+  "speculative_config": {
+    "method": "mtp",
+    "num_speculative_tokens": 4
+  },
+  "per_request_spec_decode_metrics": "summary",
+  "enforce_eager": false,
+  "additional_config": {
+    "flash_next_direct_host_kv": {
+      "num_blocks": 1024,
+      "max_bytes": 137438953472,
+      "allow_cudagraph": true
+    }
+  },
+  "kv_transfer_config": {
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "cpu_bytes_to_use": 8589934592,
+      "idle_ttl_seconds": 3600,
+      "eviction_policy": "lru",
+      "use_shared_memory": false
+    }
+  },
+  "max_num_scheduled_tokens": 2048,
+  "enable_chunked_prefill": true,
+  "long_prefill_token_threshold": 0,
+  "disable_custom_all_reduce": true,
+  "limit_mm_per_prompt": {
+    "image": 4,
+    "video": 0
+  },
+  "mm_processor_kwargs": {
+    "size": {
+      "longest_edge": 1048576,
+      "shortest_edge": 65536
+    }
+  },
+  "mm_processor_cache_gb": 0
+}

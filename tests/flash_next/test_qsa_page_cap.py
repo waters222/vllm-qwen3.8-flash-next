@@ -27,10 +27,11 @@ class PageCapTests(unittest.TestCase):
         self.config = NS(
             model_config=NS(
                 hf_text_config=NS(
-                    layer_types=["full_attention"] * 12, mtp_num_hidden_layers=1
+                    layer_types=["full_attention"] * 12, mtp_num_hidden_layers=1,
+                    model_type="qwen4_exp_text",
                 )
             ),
-            parallel_config=NS(pipeline_parallel_size=2),
+            parallel_config=NS(pipeline_parallel_size=2, tensor_parallel_size=4),
             speculative_config=NS(),
         )
 
@@ -63,6 +64,27 @@ class PageCapTests(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 self.block_size(self.config, 1634304)
+
+    def test_expanding_experiment_preserves_auto_and_rejects_conflicting_cap(self):
+        self.config.parallel_config.pipeline_parallel_size = 1
+        with patch.dict(os.environ, {
+            "VLLM_QSA_KV_OFFLOAD": "1", "VLLM_QSA_OFFLOAD_BLOCK_SIZE_CAP": "0",
+            "VLLM_FLASH_QSA_BLOCK_SIZE": "0",
+        }):
+            self.assertEqual(self.block_size(self.config, 822272), 944)
+            os.environ["VLLM_FLASH_QSA_BLOCK_SIZE"] = "944"
+            self.assertEqual(self.block_size(self.config, 822272), 944)
+            os.environ["VLLM_FLASH_QSA_BLOCK_SIZE"] = "2048"
+            self.assertEqual(self.block_size(self.config, 822272), 2048)
+            os.environ["VLLM_FLASH_QSA_BLOCK_SIZE"] = "1024"
+            self.assertEqual(self.block_size(self.config, 822272), 1024)
+            os.environ["VLLM_QSA_OFFLOAD_BLOCK_SIZE_CAP"] = "944"
+            with self.assertRaises(ValueError):
+                self.block_size(self.config, 822272)
+            os.environ["VLLM_QSA_OFFLOAD_BLOCK_SIZE_CAP"] = "0"
+            self.config.parallel_config.tensor_parallel_size = 2
+            with self.assertRaises(ValueError):
+                self.block_size(self.config, 822272)
 
 
 if __name__ == "__main__":

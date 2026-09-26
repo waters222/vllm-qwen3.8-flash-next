@@ -3,7 +3,7 @@
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
 
@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheSpec,
@@ -118,6 +119,7 @@ class KVBlockZeroer:
         static_forward_context: dict[str, Any],
         num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
+        host_group_ids: tuple[int, ...] = (),
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
@@ -153,6 +155,8 @@ class KVBlockZeroer:
         seg_page_sizes: list[int] = []
 
         for group in attn_groups_iter:
+            if group.kv_cache_group_id in host_group_ids:
+                continue
             spec = group.kv_cache_spec
             if not isinstance(spec, AttentionSpec):
                 continue
@@ -392,6 +396,67 @@ def allocate_kv_cache(
     layout: KVCacheLayout,
     kernel_block_sizes: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """Allocate independent GPU and resident-host pools using native views."""
+    if kv_cache_config.direct_host_num_blocks is None:
+        return _allocate_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
+    if kv_cache_config.hisparse_host_num_blocks is not None:
+        raise ValueError("Direct host KV cannot use a HiSparse layout")
+    if kv_cache_config.direct_host_num_blocks < 2:
+        raise ValueError("Direct host KV needs a null block and usable capacity")
+    host_groups = [
+        group for group in kv_cache_config.kv_cache_groups if group.host_resident
+    ]
+    if not host_groups or any(
+        group.role is not KVCacheGroupRole.DIRECT_HOST for group in host_groups
+    ):
+        raise ValueError("Direct host allocation requires direct-host cache groups")
+    host_tensors = [t for t in kv_cache_config.kv_cache_tensors if t.host_resident]
+    host_names = {name for group in host_groups for name in group.layer_names}
+    tensor_host_names = [name for t in host_tensors for name in t.layers]
+    if set(tensor_host_names) != host_names or len(tensor_host_names) != len(
+        host_names
+    ):
+        raise ValueError("Direct host tensors do not cover the owned host layers")
+    device_tensors = [
+        t for t in kv_cache_config.kv_cache_tensors if not t.host_resident
+    ]
+    if any(host_names.intersection(t.layers) for t in device_tensors):
+        raise ValueError("Host layers cannot also have a GPU allocation")
+    if host_tensors:
+        sizes = {t.size for t in host_tensors}
+        if len(sizes) != 1 or min(sizes) <= 0:
+            raise ValueError("Direct host tensors must share one positive backing size")
+        # Conservatively account for the pinned allocator's rounded bin.
+        reserved_bytes = 1 << (sizes.pop() - 1).bit_length()
+        budget = kv_cache_config.direct_host_max_bytes
+        if budget is None or reserved_bytes > budget:
+            raise ValueError("Direct host pinned allocation exceeds its worker budget")
+    caches = _allocate_kv_cache(
+        replace(kv_cache_config, kv_cache_tensors=device_tensors),
+        device,
+        layout,
+        kernel_block_sizes,
+    )
+    caches.update(
+        _allocate_kv_cache(
+            replace(kv_cache_config, kv_cache_tensors=host_tensors),
+            torch.device("cpu"),
+            layout,
+            kernel_block_sizes,
+            pin_memory=True,
+        )
+    )
+    return caches
+
+
+def _allocate_kv_cache(
+    kv_cache_config: KVCacheConfig,
+    device: torch.device,
+    layout: KVCacheLayout,
+    kernel_block_sizes: list[int] | None = None,
+    *,
+    pin_memory: bool = False,
+) -> dict[str, torch.Tensor]:
     """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
 
     Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
@@ -418,7 +483,7 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    buf = torch.zeros(buf_size, dtype=torch.int8, device=device, pin_memory=pin_memory)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:

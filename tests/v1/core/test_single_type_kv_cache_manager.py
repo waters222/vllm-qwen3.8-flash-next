@@ -6,6 +6,7 @@ import random
 import pytest
 import torch
 
+from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -20,6 +21,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     RSWAManager,
     SlidingWindowManager,
 )
+from vllm.v1.hisparse.block_pool import IdleExpiringHostBlockPool
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
@@ -30,6 +32,179 @@ from vllm.v1.kv_cache_interface import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture
+def idle_host_pool(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("vllm.v1.hisparse.block_pool.monotonic", lambda: now[0])
+    owner = BlockPool(4, True, 4, enable_kv_cache_events=True)
+    pool = IdleExpiringHostBlockPool(
+        4,
+        True,
+        4,
+        enable_kv_cache_events=True,
+        medium=MEDIUM_CPU,
+        event_owner=owner,
+    )
+    return pool, owner, now
+
+
+def _cache_host_block(pool, block, key=b"prefix", group=0):
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(BlockHash(key), group), block, num_tokens=4
+    )
+
+
+@pytest.mark.parametrize(
+    "capacity,seed_complete_blocks,seed_requests,retained",
+    [
+        (512, 5, 1, True),
+        (512, 31, 1, False),
+        (512, 33, 1, False),
+        (1024, 33, 1, True),
+        # 254 complete 944-token pages cover the aligned prefix of 240k tokens.
+        (1024, 254, 1, True),
+        (1024, 254, 2, False),
+        (2048, 254, 2, True),
+        (2048, 254, 4, False),
+        (2560, 254, 4, True),
+        (4096, 254, 4, True),
+        (8192, 254, 8, True),
+    ],
+)
+def test_host_pressure_needs_room_for_retained_prefix_and_private_tails(
+    monkeypatch, capacity, seed_complete_blocks, seed_requests, retained
+):
+    """Two host groups must fit cached history plus each live writable tail."""
+    monkeypatch.setattr("vllm.v1.hisparse.block_pool.monotonic", lambda: 0.0)
+    owner = BlockPool(4, True, 944, enable_kv_cache_events=True)
+    pool = IdleExpiringHostBlockPool(
+        capacity, True, 944, medium=MEDIUM_CPU, event_owner=owner
+    )
+
+    def completed_request(name, complete_blocks):
+        # Target and MTP each keep aligned pages and one unhashed tail.
+        blocks = pool.get_new_blocks(2 * (complete_blocks + 1))
+        keys = []
+        for index, block in enumerate(blocks[: 2 * complete_blocks]):
+            key = BlockHash(f"{name}-{index // 2}".encode())
+            group = index % 2
+            pool._insert_block_hash(
+                make_block_hash_with_group_id(key, group), block, num_tokens=944
+            )
+            keys.append((key, group))
+        pool.free_blocks(reversed(blocks))
+        return keys
+
+    seed_keys = [
+        key
+        for request in range(seed_requests)
+        for key in completed_request(f"seed-{request}", seed_complete_blocks)
+    ]
+    for pressure in range(32):
+        completed_request(f"pressure-{pressure}", 7)
+    complete_prefix_present = all(
+        pool.get_cached_block(key, [group]) is not None for key, group in seed_keys
+    )
+    assert complete_prefix_present is retained
+    assert pool.expire_idle() == 0  # Capacity eviction, not the 60-minute TTL.
+    assert pool.get_num_free_blocks() == capacity - 1
+
+
+def test_host_ttl_never_expires_shared_active_pages(idle_host_pool):
+    pool, owner, now = idle_host_pool
+    block = pool.get_new_blocks(1)[0]
+    _cache_host_block(pool, block)
+    now[0] = 10000
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) == [block]
+    pool.touch([block])
+    pool.free_blocks([block])
+    now[0] = 20000
+    assert pool.expire_idle() == 0
+    pool.free_blocks([block])
+    now[0] = 23599
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) == [block]
+    now[0] = 23600
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) is None
+    assert block.block_hash is None and block.ref_cnt == 0
+    assert pool.get_num_free_blocks() == 3
+    events = list(owner.take_events())
+    assert len(events) == 1 and isinstance(events[0], BlockRemoved)
+    assert events[0].medium == MEDIUM_CPU and events[0].group_idx == 0
+
+
+def test_host_expiry_removes_all_aliases_but_not_active_duplicate(idle_host_pool):
+    pool, _, now = idle_host_pool
+    old, active = pool.get_new_blocks(2)
+    _cache_host_block(pool, old)
+    _cache_host_block(pool, old, key=b"alias", group=1)
+    _cache_host_block(pool, active)
+    pool.free_blocks([old])
+    now[0] = 3600
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) == [active]
+    assert pool.get_cached_block(BlockHash(b"alias"), [1]) is None
+    assert old.block_id not in pool.cached_block_hashes_by_block
+    assert active.ref_cnt == 1
+
+
+def test_host_expiry_preserves_reader_until_native_reuse(idle_host_pool):
+    pool, _, now = idle_host_pool
+    block = pool.get_new_blocks(1)[0]
+    _cache_host_block(pool, block)
+    reused = []
+    pool.unpin_blocks([block], on_reuse=lambda b: reused.append(b.block_id))
+    now[0] = 3600
+    assert pool.expire_idle() == 1
+    assert reused == []
+    assert pool.get_new_blocks(1) == [block]
+    assert reused == [block.block_id]
+    _cache_host_block(pool, block, key=b"new")
+    now[0] = 9000
+    assert pool.get_cached_block(BlockHash(b"new"), [0]) == [block]
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) is None
+
+
+def test_host_ttl_refreshes_after_reuse_and_reset_clears_deadlines(idle_host_pool):
+    pool, _, now = idle_host_pool
+    block = pool.get_new_blocks(1)[0]
+    _cache_host_block(pool, block)
+    pool.free_blocks([block])
+    now[0] = 3599
+    hit = pool.get_cached_block(BlockHash(b"prefix"), [0])
+    # Native touch must preserve an offered page even across its idle deadline.
+    now[0] = 3601
+    pool.touch(hit)
+    pool.free_blocks(hit)
+    now[0] = 7000
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) == [block]
+    assert pool.reset_prefix_cache()
+    allocated = pool.get_new_blocks(3)
+    for new in allocated:
+        _cache_host_block(pool, new, key=str(new.block_id).encode())
+    now[0] = 20000
+    assert pool.expire_idle() == 0
+    assert pool.get_num_free_blocks() == 0
+
+
+@pytest.mark.parametrize("ttl", [0, -1, True, float("nan"), float("inf"), "3600"])
+def test_host_ttl_rejects_invalid_lifetime(ttl):
+    with pytest.raises(ValueError, match="finite positive"):
+        IdleExpiringHostBlockPool(idle_ttl_seconds=ttl)
+
+
+def test_host_ttl_disabled_keeps_native_lru(idle_host_pool):
+    _, owner, now = idle_host_pool
+    pool = IdleExpiringHostBlockPool(
+        2, True, 4, medium=MEDIUM_CPU, event_owner=owner, idle_ttl_seconds=None
+    )
+    block = pool.get_new_blocks(1)[0]
+    _cache_host_block(pool, block)
+    pool.free_blocks([block])
+    now[0] = 100000
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) == [block]
+    assert pool.get_new_blocks(1) == [block]
+    assert pool.get_cached_block(BlockHash(b"prefix"), [0]) is None
 
 
 def test_external_computed_blocks_do_not_corrupt_free_pool():

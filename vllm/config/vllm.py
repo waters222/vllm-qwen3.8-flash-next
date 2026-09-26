@@ -2659,11 +2659,19 @@ class VllmConfig:
 
         ec_config = self.ec_transfer_config
         kv_config = self.kv_transfer_config
+        # Local cache offloading uses kv_both but receives no disaggregated
+        # requests. It must not enable embedding-only MM inputs or allow
+        # missing embedding tensors as a side effect of retaining KV state.
+        disaggregated_kv_consumer = (
+            kv_config is not None
+            and kv_config.is_kv_consumer
+            and kv_config.kv_connector != "OffloadingConnector"
+        )
         # Derived, so overwrite unconditionally rather than honouring a value
         # that was set by hand.
         mm_config.allow_missing_mm_embeddings = (
             ec_config is not None and ec_config.is_ec_consumer
-        ) or (kv_config is not None and kv_config.is_kv_consumer)
+        ) or disaggregated_kv_consumer
         if not mm_config.allow_missing_mm_embeddings:
             return
 

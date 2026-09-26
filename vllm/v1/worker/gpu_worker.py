@@ -955,6 +955,18 @@ class Worker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    @torch.inference_mode()
+    def flash_session_swap(self, operation: str, payload: dict) -> dict:
+        """Internal drained-engine RPC for the opt-in session swap coordinator."""
+        adapter = getattr(self.model_runner, "flash_session_worker", None)
+        if adapter is None:
+            raise ValueError("Flash session swapping is disabled")
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+        return {**adapter.dispatch(operation, payload), "key": dict(payload["key"])}
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

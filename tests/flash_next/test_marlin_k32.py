@@ -99,6 +99,18 @@ class K32GateTests(unittest.TestCase):
                 },
             )
 
+    def test_large_budget_requires_explicit_bounded_moe_chunking(self):
+        env = {"VLLM_FLASH_TP4_MARLIN_K32": "1",
+               "VLLM_FLASH_TP4_PREFILL_CHUNKS": "1"}
+        for budget in (4096, 8192):
+            self.config.scheduler_config.max_num_batched_tokens = budget
+            self.assertTrue(self.gate(self.config, env))
+        self.config.scheduler_config.max_num_batched_tokens = 8193
+        with self.assertRaises(ValueError):
+            self.gate(self.config, env)
+        with self.assertRaises(ValueError):
+            self.gate(self.config, dict(env, VLLM_FLASH_TP4_PREFILL_CHUNKS="yes"))
+
 
 if __name__ == "__main__":
     unittest.main()

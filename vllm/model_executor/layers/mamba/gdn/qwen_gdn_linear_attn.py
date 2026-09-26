@@ -39,6 +39,11 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.flash_next_prefill_checkpoint import (
+    enable_checkpoint_spec,
+    export_gdn_checkpoint,
+    store_checkpoint_history,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -379,6 +384,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_v_dim,
             self.conv_kernel_size,
             self.num_spec,
+        )
+
+    def get_kv_cache_spec(self, vllm_config):
+        return enable_checkpoint_spec(
+            super().get_kv_cache_spec(vllm_config), vllm_config,
+            self.gdn_prefill_backend,
         )
 
     def __init__(
@@ -1330,6 +1341,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
+        checkpoint = attn_metadata.prefill_checkpoint
+        if checkpoint is not None:
+            store_checkpoint_history(
+                mixed_qkv, conv_state, checkpoint, self.conv1d.weight.shape[-1] - 1
+            )
+
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -1525,6 +1542,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
+            if checkpoint is not None:
+                export_gdn_checkpoint(
+                    self.chunk_gated_delta_rule, checkpoint,
+                    query_non_spec, key_non_spec, value_non_spec,
+                    g_non_spec, beta_non_spec, initial_state, ssm_state,
+                )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,

@@ -2202,6 +2202,36 @@ class SinkFullAttentionManager(FullAttentionManager):
         assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0
 
 
+class DirectHostFullAttentionManager(FullAttentionManager):
+    """Strict-capacity host KV using native hashes, references and eviction.
+
+    Unlike HiSparse, there is no GPU fallback for an unavailable host page.
+    Only full-block prefix hits are supported until host CoW is integrated.
+    """
+
+    supports_fine_grained_hash_lookup = False
+    retains_longer_hit = True
+
+    def __init__(self, kv_cache_spec: KVCacheSpec, **kwargs) -> None:
+        if type(kv_cache_spec) is not FullAttentionSpec:
+            raise ValueError("Direct host KV requires a full-attention spec")
+        kwargs["needs_kv_cache_zeroing"] = False
+        super().__init__(kv_cache_spec, **kwargs)
+
+    def bind_host_pool(self, pool: BlockPool) -> None:
+        if self.req_to_blocks or self._pending_cow_copies:
+            raise RuntimeError("Cannot rebind an active host KV manager")
+        if pool.medium != MEDIUM_CPU:
+            raise ValueError("Direct host KV requires a CPU block pool")
+        self.block_pool = pool
+        self._null_block = pool.null_block
+
+    def take_pending_cow_copies(self) -> list[tuple[KVCacheBlock, KVCacheBlock]]:
+        if self._pending_cow_copies:
+            raise RuntimeError("Direct host KV copy-on-write is not integrated")
+        return []
+
+
 class HiSparseSourceManager(FullAttentionManager):
     """Host-tier manager with a private pool; publishes hashes once durable.
 
@@ -2262,8 +2292,9 @@ class HiSparseSourceManager(FullAttentionManager):
             )
         ):
             # External loads need real destinations; future GPU-computed pages
-            # remain best effort. Use the same admission sentinel as Mamba.
-            required = super().get_num_blocks_to_allocate(
+            # remain best effort. The coordinator checks this host pool's
+            # capacity independently from the GPU pool.
+            return super().get_num_blocks_to_allocate(
                 request_id,
                 total_computed_tokens,
                 new_computed_blocks,
@@ -2271,10 +2302,6 @@ class HiSparseSourceManager(FullAttentionManager):
                 num_local_computed_tokens,
                 total_computed_tokens,
             )
-            if required > self.block_pool.get_num_free_blocks():
-                assert self.coordinator is not None
-                assert self.coordinator.gpu_pool is not None
-                return self.coordinator.gpu_pool.num_gpu_blocks + 1
         return 0
 
     def allocate_new_blocks(
@@ -2627,6 +2654,9 @@ def get_manager_for_kv_cache_spec(
 
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
+    KVCacheSpecRegistry.register_role_manager(
+        KVCacheGroupRole.DIRECT_HOST, DirectHostFullAttentionManager
+    )
     KVCacheSpecRegistry.register_role_manager(
         KVCacheGroupRole.HISPARSE_SOURCE, HiSparseSourceManager
     )

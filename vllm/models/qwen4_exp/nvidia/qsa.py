@@ -11,10 +11,10 @@ import torch
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -45,8 +45,10 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import (
+    DirectHostAttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    get_direct_host_cache_options,
     get_kv_quant_mode,
 )
 
@@ -94,6 +96,31 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
 
 
 _QSA_STAGE_MIN_ROWS = 64
+_QSA_PREFILL_METADATA_STATS = {"reads": 0, "hits": 0}
+
+
+def _qsa_prefill_host_metadata(layer, metadata, num_requests):
+    """Read exact immutable metadata once within an eager model forward."""
+    cache = None
+    if (
+        getattr(layer, "_qsa_prefill_metadata_cache", False)
+        and is_forward_context_available()
+    ):
+        context = get_forward_context()
+        if context.cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            cache = context.additional_kwargs.setdefault(
+                "qsa_prefill_host_metadata", {}
+            )
+            cached = cache.get(id(metadata))
+            if cached is not None and cached[0] is metadata:
+                _QSA_PREFILL_METADATA_STATS["hits"] += 1
+                return cached[1], cached[2]
+    offsets = metadata.query_start_loc[: num_requests + 1].tolist()
+    lengths = metadata.seq_lens[:num_requests].tolist()
+    if cache is not None:
+        _QSA_PREFILL_METADATA_STATS["reads"] += 1
+        cache[id(metadata)] = (metadata, offsets, lengths)
+    return offsets, lengths
 
 
 def _qsa_staged_prefill(
@@ -109,10 +136,9 @@ def _qsa_staged_prefill(
 ):
     """Serve prefill rows from host-resident K/V through a staging arena.
 
-    Returns the ``(start, end)`` row range that was handled, or None to leave
-    the whole batch to the direct path. Only the contiguous rows of a single
-    request can be staged, so a mixed batch is served for its largest request
-    and the remaining rows fall back to the direct path.
+    Returns ordered ``(start, end)`` ranges, or None for the direct path.
+    The opt-in multi-request path reuses one arena sequentially. Each staged
+    call still handles one request and its own block table.
     """
     if not getattr(layer, "_qsa_kv_offload", False):
         return None
@@ -126,37 +152,44 @@ def _qsa_staged_prefill(
     num_requests = int(seq_lens.shape[0])
     if num_requests < 1 or starts.shape[0] < num_requests + 1:
         return None
-    offsets = starts[: num_requests + 1].tolist()
-    lengths = seq_lens[:num_requests].tolist()
-    best = max(range(num_requests), key=lambda i: offsets[i + 1] - offsets[i])
-    start, end = offsets[best], offsets[best + 1]
-    if end - start < min_rows or end > num_tokens:
+    offsets, lengths = _qsa_prefill_host_metadata(layer, attn_metadata, num_requests)
+    if getattr(layer, "_qsa_stage_all_prefill", False):
+        requests = range(num_requests)
+    else:
+        requests = [max(range(num_requests), key=lambda i: offsets[i + 1] - offsets[i])]
+    page_size = kv_cache.shape[2]
+    ranges = []
+    for request in requests:
+        start, end = offsets[request], offsets[request + 1]
+        max_page = (max(int(lengths[request]), 1) - 1) // page_size
+        if (
+            0 <= start < end <= num_tokens
+            and end - start >= min_rows
+            and max_page < attn_metadata.block_table.shape[1]
+        ):
+            ranges.append((request, start, end, max_page))
+    if not ranges:
         return None
 
     from .ops.qsa import qsa_get_staging_arena, qsa_sparse_paged_attention_staged
 
-    arena = qsa_get_staging_arena(
-        kv_cache, getattr(layer, "_qsa_stage_arena_bytes", 0)
-    )
+    arena = qsa_get_staging_arena(kv_cache, getattr(layer, "_qsa_stage_arena_bytes", 0))
     if arena is None:
         return None
-    page_size = kv_cache.shape[2]
-    max_logical_page = (max(int(lengths[best]), 1) - 1) // page_size
-    if max_logical_page >= attn_metadata.block_table.shape[1]:
-        return None
-    rows = torch.arange(start, end, device=query.device, dtype=torch.int64)
-    qsa_sparse_paged_attention_staged(
-        query[:num_tokens],
-        kv_cache,
-        logical_indices,
-        attn_metadata.block_table[best],
-        rows,
-        max_logical_page,
-        arena,
-        use_prefill_config,
-        output[:num_tokens],
-    )
-    return start, end
+    for request, start, end, max_page in ranges:
+        rows = torch.arange(start, end, device=query.device, dtype=torch.int64)
+        qsa_sparse_paged_attention_staged(
+            query[:num_tokens],
+            kv_cache,
+            logical_indices,
+            attn_metadata.block_table[request],
+            rows,
+            max_page,
+            arena,
+            use_prefill_config,
+            output[:num_tokens],
+        )
+    return [(start, end) for _, start, end, _ in ranges]
 
 
 class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
@@ -215,6 +248,19 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
         from .ops.qsa import qsa_sparse_paged_attention
 
+        if getattr(layer, "_qsa_verify_staging", False) and not use_prefill_config:
+            from .ops.qsa_verify_staging import try_verify_staging
+
+            if try_verify_staging(
+                layer,
+                query[:num_tokens],
+                kv_cache,
+                logical_indices,
+                attn_metadata,
+                output[:num_tokens],
+            ):
+                return output
+
         staged = _qsa_staged_prefill(
             layer,
             query,
@@ -238,8 +284,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 output[:num_tokens],
             )
             return output
-        staged_start, staged_end = staged
-        for low, high in ((0, staged_start), (staged_end, num_tokens)):
+        low = 0
+        for high, end in [*staged, (num_tokens, num_tokens)]:
             if high > low:
                 qsa_sparse_paged_attention(
                     query[low:high],
@@ -251,6 +297,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     use_prefill_config,
                     output[low:high],
                 )
+            low = end
         return output
 
 
@@ -397,16 +444,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if self._qsa_kv_offload:
             tp4_pilot = os.environ.get("VLLM_FLASH_QSA_TP4", "0") == "1"
             if tp_size not in (1, 2) and not (tp4_pilot and tp_size == 4):
-                raise NotImplementedError("QSA host KV TP4 requires VLLM_FLASH_QSA_TP4=1")
+                raise NotImplementedError(
+                    "QSA host KV TP4 requires VLLM_FLASH_QSA_TP4=1"
+                )
             if vllm_config.parallel_config.data_parallel_size != 1:
                 raise NotImplementedError("QSA host KV budget requires DP=1")
             if self.total_num_kv_heads % tp_size and not (
                 tp4_pilot and tp_size == 4 and self.total_num_kv_heads == 2
             ):
-                raise NotImplementedError("QSA host KV requires evenly sharded KV heads")
+                raise NotImplementedError(
+                    "QSA host KV requires evenly sharded KV heads"
+                )
             replicas = max(1, tp_size // self.total_num_kv_heads)
             if self.num_kv_heads * tp_size != self.total_num_kv_heads * replicas:
-                raise RuntimeError("QSA host KV local head count disagrees with TP layout")
+                raise RuntimeError(
+                    "QSA host KV local head count disagrees with TP layout"
+                )
             # Count all physical pools, including replicated KV heads at TP4.
             self._qsa_offload_tp_size = tp_size
             if self.num_heads % self.num_kv_heads:
@@ -425,6 +478,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     1 + vllm_config.num_speculative_tokens,
                 )
         self._qsa_stage_min_rows = _QSA_STAGE_MIN_ROWS
+        self._qsa_prefill_metadata_cache = (
+            os.environ.get("VLLM_FLASH_QSA_PREFILL_METADATA_CACHE", "0") == "1"
+        )
+        self._qsa_verify_staging = (
+            os.environ.get("VLLM_FLASH_QSA_VERIFY_STAGING", "0") == "1"
+        )
+        self._qsa_stage_all_prefill = (
+            os.environ.get("VLLM_QSA_STAGE_ALL_PREFILL", "0") == "1"
+        )
         self._qsa_stage_arena_bytes = int(
             os.environ.get("VLLM_QSA_KVO_ARENA", str(192 * 1024 * 1024))
         )
@@ -476,6 +538,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if get_direct_host_cache_options(vllm_config) is not None:
+            if not self._qsa_kv_offload:
+                raise ValueError("Direct host QSA requires VLLM_QSA_KV_OFFLOAD=1")
+            return DirectHostAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                head_size_v=self.head_dim,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+                is_mtp_draft=getattr(self, "_qsa_is_mtp_draft", False),
+            )
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
@@ -489,6 +563,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         if not self._qsa_kv_offload:
+            if kv_cache.device.type == "cpu":
+                raise ValueError("QSA resident host KV requires RAM KV enabled")
             super().bind_kv_cache(kv_cache)
             return
         from vllm.logger import init_logger
@@ -497,6 +573,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
         if not is_uva_available():
             raise RuntimeError("QSA host KV requires CUDA UVA")
+        if kv_cache.device.type == "cpu":
+            if (
+                not kv_cache.is_pinned()
+                or kv_cache.dtype != torch.bfloat16
+                or kv_cache.ndim != 4
+                or kv_cache.shape[1] != self.num_kv_heads
+                or kv_cache.shape[3] != 2 * self.head_dim
+            ):
+                raise ValueError("QSA resident host KV requires pinned BF16 real pages")
+            # Allocation and its byte ceiling belong to the native host pool.
+            # Keep the exact view alive: no second host copy or GPU placeholder.
+            self._qsa_host_kv = kv_cache
+            self._qsa_gpu_slots = None
+            self.kv_cache = get_accelerator_view_from_cpu_tensor(kv_cache)
+            return
         if kv_cache.ndim != 4 or kv_cache.shape[1] != 1 or kv_cache.shape[3] != 1:
             raise ValueError("QSA host KV expected [blocks, 1, tokens, 1] GPU slots")
         num_blocks, _, block_size, _ = kv_cache.shape
@@ -507,8 +598,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # Pinned allocations may be rounded to power-of-two allocator bins.
         # Budget conservatively for all TP ranks, not only this local shard.
         reserved_layer_bytes = 1 << (max(1, layer_bytes) - 1).bit_length()
-        total_bytes = (reserved_layer_bytes * self._qsa_offload_layers
-                       * self._qsa_offload_tp_size)
+        total_bytes = (
+            reserved_layer_bytes * self._qsa_offload_layers * self._qsa_offload_tp_size
+        )
         budget = float(os.environ.get("VLLM_QSA_KV_OFFLOAD_MAX_GIB", "64")) * 2**30
         if total_bytes > budget:
             raise RuntimeError(
@@ -524,7 +616,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache = get_accelerator_view_from_cpu_tensor(self._qsa_host_kv)
         init_logger(__name__).info(
             "QSA host KV %s: %d blocks x %d tokens, %.3f GiB pinned (UVA)",
-            self.layer_name, num_blocks, block_size, layer_bytes / 2**30,
+            self.layer_name,
+            num_blocks,
+            block_size,
+            layer_bytes / 2**30,
         )
 
     @eager_break_during_capture

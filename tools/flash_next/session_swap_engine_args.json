@@ -1,0 +1,21 @@
+{
+  "model": "/model",
+  "served_model_name": "Qwen3.8-Flash-Next",
+  "language_model_only": true,
+  "tensor_parallel_size": 2,
+  "pipeline_parallel_size": 2,
+  "engram_config": {"cpu_offload": true},
+  "max_model_len": 240000,
+  "max_num_seqs": 8,
+  "max_num_batched_tokens": 2048,
+  "gpu_memory_utilization": 0.92,
+  "enable_prefix_caching": false,
+  "compilation_config": {
+    "mode": 0,
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "cudagraph_capture_sizes": [1, 2, 3, 4, 6, 8, 9, 12, 18, 24]
+  },
+  "kv_cache_memory_bytes": 750000000,
+  "mamba_cache_mode": "align",
+  "speculative_config": {"method": "mtp", "num_speculative_tokens": 2}
+}

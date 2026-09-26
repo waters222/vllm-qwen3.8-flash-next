@@ -205,11 +205,12 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
-        logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
-            rank,
-            result,
+        # The CPU-to-GPU Triton path dereferences this mapping through UVA.
+        # Pageable DMA is not a safe fallback for that path.
+        raise RuntimeError(
+            f"cudaHostRegister failed for rank={rank} "
+            f"bytes={region.total_size_bytes} code={result.value}; "
+            "CPU KV offloading requires registered host memory"
         )
     else:
         logger.debug(

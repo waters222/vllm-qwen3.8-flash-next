@@ -24,11 +24,7 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
-def _all_workers_barrier() -> None:
-    """Block until every worker rank has reached this point (gloo cpu group).
-
-    A superset of the node-local mmap openers suffices: once the barrier
-    releases, every worker sharing the region file has mapped it."""
+def _all_workers_group():
     from vllm.distributed.parallel_state import (
         get_inner_dp_world_group,
         get_world_group,
@@ -38,7 +34,20 @@ def _all_workers_barrier() -> None:
         group = get_inner_dp_world_group()
     except AssertionError:
         group = get_world_group()
-    group.barrier()
+    return group
+
+
+def _all_workers_barrier() -> None:
+    """Wait until every worker sharing the region has mapped it."""
+    _all_workers_group().barrier()
+
+
+def _validate_pp_mmap_geometry(geometry: tuple[int, int, int]) -> None:
+    group = _all_workers_group().cpu_group
+    layouts = [None] * torch.distributed.get_world_size(group)
+    torch.distributed.all_gather_object(layouts, geometry, group=group)
+    if any(layout != geometry for layout in layouts):
+        raise ValueError("PP CPU offload workers disagree on shared mmap geometry")
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -80,6 +89,11 @@ class CPUOffloadingSpec(OffloadingSpec):
             ),
         }
         store_threshold = int(extra_config.get("store_threshold", 0))
+        definitions[CPUOffloadingMetrics.CPU_CACHE_EXPIRED_CHUNKS] = (
+            OffloadingCounterMetadata(
+                documentation="Number of idle CPU cache chunks removed by TTL expiry.",
+            )
+        )
         if store_threshold >= 2:
             definitions[CPUOffloadingMetrics.STORES_SKIPPED] = (
                 OffloadingCounterMetadata(
@@ -93,6 +107,9 @@ class CPUOffloadingSpec(OffloadingSpec):
 
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
+        self.use_shared_memory = self.extra_config.get("use_shared_memory", True)
+        if not isinstance(self.use_shared_memory, bool):
+            raise ValueError("use_shared_memory must be a boolean")
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
@@ -156,16 +173,25 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                idle_ttl_seconds=self.extra_config.get("idle_ttl_seconds"),
             )
         return self._manager
 
     def _uses_shared_region(self) -> bool:
         """Whether the worker CPU buffer is the shared mmap region (vs a private
         per-rank tensor); replicated-layout dedup is gated on this being True."""
-        return current_platform.is_cuda_alike()
+        return self.use_shared_memory and current_platform.is_cuda_alike()
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None
+        if self.config.parallel.pp_size > 1 and self._uses_shared_region():
+            _validate_pp_mmap_geometry(
+                (
+                    self.num_chunks,
+                    self.kv_bytes_per_chunk,
+                    self.cpu_page_size_per_worker,
+                )
+            )
         # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self._uses_shared_region() and self.num_chunks > 0:

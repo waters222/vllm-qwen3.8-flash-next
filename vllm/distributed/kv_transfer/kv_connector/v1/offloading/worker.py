@@ -128,6 +128,42 @@ class OffloadingConnectorWorker:
                 else:
                     raise NotImplementedError
 
+        packed_stride = kv_cache_config.direct_host_offload_packed_stride
+        if packed_stride is not None:
+            if kv_cache_config.direct_host_num_blocks is None:
+                raise ValueError(
+                    "Packed partial offload requires direct-host ownership"
+                )
+            views = [t for (t,) in tensors_per_block.values()]
+            if not views:
+                raise ValueError("Packed partial offload requires local GPU state")
+            storage = views[0].untyped_storage()
+            num_blocks = kv_cache_config.num_blocks
+            if storage.nbytes() != num_blocks * packed_stride or any(
+                t.untyped_storage().data_ptr() != storage.data_ptr()
+                or t.untyped_storage().nbytes() != storage.nbytes()
+                or t.device != views[0].device
+                or t.stride(0) != packed_stride
+                or t.storage_offset() + t.shape[1] > packed_stride
+                for t in views
+            ):
+                raise ValueError("Packed partial offload views do not share GPU blocks")
+            packed = views[0].as_strided(
+                (num_blocks, packed_stride), (packed_stride, 1), storage_offset=0
+            )
+            self._init_worker(
+                CanonicalKVCaches(
+                    [CanonicalKVCacheTensor(packed, packed_stride)],
+                    [
+                        [CanonicalKVCacheRef(0, packed_stride)]
+                        if group.layer_names
+                        else []
+                        for group in selected_groups
+                    ],
+                )
+            )
+            return
+
         # Packed layouts (e.g. DSv4) interleave all layers within each manager
         # block: a layer view's block stride exceeds its page size. Offload the
         # whole packed block as a single transfer region.

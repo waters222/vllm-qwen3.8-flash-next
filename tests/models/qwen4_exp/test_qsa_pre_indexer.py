@@ -61,6 +61,222 @@ def assert_fp8_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> N
     assert bool(((code_diff <= 1) | (abs_diff <= 2**-8)).all())
 
 
+def _replay_chunk(chunks, starts, raw, raw_table, compressed, comp_table, rope, mrope):
+    """Run real slot mapping and fused compression for independent requests."""
+    device = raw.device
+    lengths = [len(chunk) for chunk in chunks]
+    qk = torch.cat(chunks)
+    positions = torch.cat(
+        [
+            torch.arange(start, start + length, device=device, dtype=torch.int64)
+            for start, length in zip(starts, lengths)
+        ]
+    )
+    requests = torch.cat(
+        [
+            torch.full((length,), i, device=device, dtype=torch.int32)
+            for i, length in enumerate(lengths)
+        ]
+    )
+    query_starts = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], device=device, dtype=torch.int32
+    )
+    raw_slots = circular_qsa_slot_mapping(
+        raw_table, requests, positions, raw.shape[1], query_starts
+    )
+    comp_slots = compressed_qsa_slot_mapping(
+        comp_table, requests, positions, COMP_PAGE, CR
+    )
+    work = [
+        (request, group)
+        for request, (start, length) in enumerate(zip(starts, lengths))
+        for group in range(max((start + length) // CR - start // CR, 1))
+    ]
+    work.extend([(-1, -1)] * 2)  # Exercise inactive/padded work items.
+    metadata = torch.tensor(work, device=device, dtype=torch.int32)
+    rope_positions = (
+        torch.stack((positions, positions // 7 + 3, positions // 13 + 11))
+        if mrope
+        else positions
+    )
+    output = torch.empty(len(qk), HQ, D, device=device, dtype=compressed.dtype)
+    weight = torch.zeros(D, device=device, dtype=torch.bfloat16)
+    qsa_pre_indexer(
+        qk[:, : HQ * D],
+        qk[:, HQ * D :],
+        rope_positions,
+        rope,
+        weight,
+        weight,
+        EPS,
+        output,
+        raw,
+        raw_slots,
+        raw_table,
+        query_starts,
+        positions,
+        compressed,
+        comp_slots,
+        metadata,
+        compress_ratio=CR,
+        mrope_section=MROPE_SECTION if mrope else None,
+        rope_pos_offset=D if mrope else None,
+    )
+    return list(output.split(lengths))
+
+
+def _ring_replay_case(boundary, depth, dtype, mrope):
+    """Prefill once, then construct retained, relocated-cold and clean branches."""
+    generator = torch.Generator(device="cuda").manual_seed(173)
+    state_size = CR * ((CR + depth + CR - 1) // CR)
+    ends = [boundary, boundary + CR]
+    max_len = max(ends) + 128
+    values = torch.randn(
+        2,
+        max_len,
+        (HQ + 1) * D,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    angles = torch.arange(max_len, device="cuda", dtype=torch.float32)[:, None]
+    frequencies = 10000000.0 ** (-torch.arange(D // 4, device="cuda") / (D // 4))
+    angles = angles * frequencies
+    rope = torch.cat((angles.cos(), angles.sin()), dim=1).to(torch.bfloat16)
+    raw_width = D + 12 if mrope else D
+    storage = torch.zeros(
+        5, state_size * raw_width + 16, device="cuda", dtype=torch.bfloat16
+    )
+
+    def view(backing):
+        return torch.as_strided(
+            backing,
+            (5, state_size, 1, raw_width),
+            (backing.stride(0), raw_width, raw_width, 1),
+        )
+
+    raw = view(storage)
+    raw_table = torch.tensor([[2], [1]], device="cuda", dtype=torch.int32)
+    cold_table = torch.tensor([[4], [3]], device="cuda", dtype=torch.int32)
+    pages = (max_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    comp_table = torch.arange(1, 2 * pages + 1, device="cuda", dtype=torch.int32)
+    comp_table = comp_table.flip(0).reshape(2, pages)
+    compressed = torch.zeros(2 * pages + 1, COMP_PAGE, 1, D, device="cuda", dtype=dtype)
+    _replay_chunk(
+        [values[r, :end] for r, end in enumerate(ends)],
+        [0, 0],
+        raw,
+        raw_table,
+        compressed,
+        comp_table,
+        rope,
+        mrope,
+    )
+    cold = view(storage.clone())
+    cold[..., :D].fill_(float("nan"))
+    if mrope:
+        cold[..., D:].view(torch.int64).zero_()  # Valid poison RoPE addresses.
+    states = [raw, cold, view(storage.clone())]
+    caches = [compressed, compressed.clone(), compressed.clone()]
+    return (
+        values,
+        ends,
+        states,
+        [raw_table, cold_table, raw_table],
+        caches,
+        comp_table,
+        rope,
+    )
+
+
+def _logical_compressed(cache, table, request, end):
+    return cache[table[request].long()].reshape(-1, D)[: end // CR].view(torch.uint8)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("boundary", [16, 3504])
+@pytest.mark.parametrize("depth", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_qsa_aligned_prefix_rebuilds_ring_with_rejected_draft_rows(
+    boundary, depth, dtype, mrope
+):
+    if dtype == torch.float8_e4m3fn and not current_platform.has_device_capability(89):
+        pytest.skip("The native e4m3 Triton kernel requires SM89 or newer")
+    values, ends, states, tables, caches, comp_table, rope = _ring_replay_case(
+        boundary, depth, dtype, mrope
+    )
+    for step in range(13):
+        lengths = [depth + 1] * 2 if step < 12 else [17, 19]
+        accepted = (
+            [1 + (step + r) % (depth + 1) for r in range(2)] if step < 12 else lengths
+        )
+        chunks = [
+            values[r, end : end + length].clone()
+            for r, (end, length) in enumerate(zip(ends, lengths))
+        ]
+        for chunk, count in zip(chunks, accepted):
+            chunk[count:] += 5  # Rejected drafts must not leak into committed groups.
+        outputs = []
+        for branch in range(3):
+            rows = chunks if branch < 2 else [c[:n] for c, n in zip(chunks, accepted)]
+            outputs.append(
+                _replay_chunk(
+                    rows,
+                    ends,
+                    states[branch],
+                    tables[branch],
+                    caches[branch],
+                    comp_table,
+                    rope,
+                    mrope,
+                )
+            )
+        ends = [end + count for end, count in zip(ends, accepted)]
+        for request, (count, end) in enumerate(zip(accepted, ends)):
+            for branch in (0, 1):
+                assert torch.equal(
+                    outputs[branch][request][:count].view(torch.uint8),
+                    outputs[2][request].view(torch.uint8),
+                )
+                assert torch.equal(
+                    _logical_compressed(caches[branch], comp_table, request, end),
+                    _logical_compressed(caches[2], comp_table, request, end),
+                )
+    # A fully committed suffix overwrites every ring row, including position tails.
+    for request in range(2):
+        reference = states[2][int(tables[2][request, 0])].view(torch.uint8)
+        for branch in (0, 1):
+            actual = states[branch][int(tables[branch][request, 0])].view(torch.uint8)
+            assert torch.equal(actual, reference)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("offset", [1, 2, 3])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_qsa_unaligned_prefix_cannot_discard_raw_ring(offset, mrope):
+    values, ends, states, tables, caches, comp_table, rope = _ring_replay_case(
+        16 + offset, 4, torch.bfloat16, mrope
+    )
+    count = CR - offset
+    chunks = [values[r, end : end + count] for r, end in enumerate(ends)]
+    for branch in (0, 1):
+        _replay_chunk(
+            chunks,
+            ends,
+            states[branch],
+            tables[branch],
+            caches[branch],
+            comp_table,
+            rope,
+            mrope,
+        )
+    for request, end in enumerate(ends):
+        reference = _logical_compressed(caches[0], comp_table, request, end + count)
+        discarded = _logical_compressed(caches[1], comp_table, request, end + count)
+        assert not torch.equal(reference, discarded)
+
+
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 @pytest.mark.parametrize("indexer_dtype", [torch.bfloat16, torch.float8_e4m3fn])

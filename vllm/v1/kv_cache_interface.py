@@ -633,6 +633,66 @@ class FullAttentionSpec(AttentionSpec):
         return merged_spec
 
 
+@dataclass(frozen=True, kw_only=True)
+class DirectHostAttentionSpec(FullAttentionSpec):
+    """Model-side placement marker; grouping converts it to ordinary host pages."""
+
+    is_mtp_draft: bool = False
+
+
+def get_direct_host_cache_options(vllm_config: VllmConfig) -> tuple[int, int] | None:
+    """Read the explicit experimental host-pool capacity and total byte ceiling."""
+    additional = vllm_config.additional_config
+    if (
+        not isinstance(additional, dict)
+        or "flash_next_direct_host_kv" not in additional
+    ):
+        return None
+    options = additional["flash_next_direct_host_kv"]
+    required = {"num_blocks", "max_bytes"}
+    if (
+        not isinstance(options, dict)
+        or not required <= options.keys()
+        or options.keys() - required - {"allow_cudagraph"}
+    ):
+        raise ValueError("flash_next_direct_host_kv requires num_blocks and max_bytes")
+    allow_cudagraph = options.get("allow_cudagraph", False)
+    if type(allow_cudagraph) is not bool:
+        raise ValueError("Direct host allow_cudagraph must be a boolean")
+    blocks, budget = options["num_blocks"], options["max_bytes"]
+    if type(blocks) is not int or blocks < 2 or type(budget) is not int or budget <= 0:
+        raise ValueError(
+            "Direct host capacity and byte budget must be positive integers"
+        )
+    if not vllm_config.model_config.enforce_eager:
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+        if not allow_cudagraph:
+            raise ValueError(
+                "Experimental direct host KV requires enforce_eager or explicit "
+                "allow_cudagraph"
+            )
+        # Manual sizing skips the GPU-only temporary graph profiling cache.
+        gpu_budget = vllm_config.cache_config.kv_cache_memory_bytes
+        if type(gpu_budget) is not int or gpu_budget <= 0:
+            raise ValueError(
+                "Direct host graphs require positive explicit kv_cache_memory_bytes"
+            )
+        compilation = vllm_config.compilation_config
+        if (
+            compilation.mode != CompilationMode.NONE
+            or compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+        ):
+            raise ValueError(
+                "Direct host graphs require compilation mode NONE and FULL_DECODE_ONLY"
+            )
+    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        raise ValueError("Direct host KV requires the hybrid cache manager")
+    if vllm_config.parallel_config.data_parallel_size != 1:
+        raise ValueError("Direct host total RAM budget requires DP=1")
+    return blocks, budget
+
+
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     if spec.alignment is None:
         return
@@ -872,6 +932,23 @@ class CircularBufferSpec(AttentionSpec):
     reads the open group's committed keys from the ring.
     """
 
+    replay_alignment: int | None = None
+    """If set, this scratch can be rebuilt from an aligned reusable prefix.
+
+    The producer must establish that no historical ring row is read before
+    being replaced. Other circular buffers remain non-transferable only when
+    their own integration explicitly qualifies this property.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.replay_alignment is not None and (
+            type(self.replay_alignment) is not int
+            or self.replay_alignment <= 0
+            or self.block_size % self.replay_alignment
+        ):
+            raise ValueError("Ring replay alignment must divide its positive capacity")
+
     @property
     def block_table_token_alignment(self) -> int | None:
         return None
@@ -889,7 +966,9 @@ class CircularBufferSpec(AttentionSpec):
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
         return all(
-            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+            isinstance(spec, CircularBufferSpec)
+            and spec.replay_alignment == self.replay_alignment
+            for spec in kv_cache_specs.values()
         )
 
     @property
@@ -1384,6 +1463,7 @@ class KVCacheTensor:
 
 class KVCacheGroupRole(str, Enum):
     DEFAULT = "default"
+    DIRECT_HOST = "direct_host"
     HISPARSE_SOURCE = "hisparse_source"
     HISPARSE_INDEXER = "hisparse_indexer"
 
@@ -1401,7 +1481,7 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
-    # Host groups use the dedicated HiSparse pool; others share the device pool.
+    # Host groups use an independent native pool; others share the device pool.
     host_resident: bool = False
     # Whether this group is part of the externally transferable KV state.
     # Ephemeral accelerator-side replicas are rebuilt from their transferable
@@ -1434,6 +1514,21 @@ class KVCacheConfig:
     """The KV cache layout resolved by the engine core, adopted by all workers."""
     hisparse_host_num_blocks: int | None = None
     """Capacity of the dedicated HiSparse host-block manager, when enabled."""
+
+    direct_host_num_blocks: int | None = None
+    """Capacity of the native pool for directly accessed, resident host KV."""
+
+    direct_host_max_bytes: int | None = None
+    """Per-worker pinned allocation ceiling for the direct host pool."""
+
+    direct_host_idle_ttl_seconds: float | None = 3600
+    """Idle prefix lifetime for direct host pages; ignored for other layouts."""
+
+    direct_host_offload_bytes_per_block: int | None = None
+    """Common per-rank CPU offload slot size across direct-host TP/PP workers."""
+
+    direct_host_offload_packed_stride: int | None = None
+    """Worker-local GPU block width eligible for native whole-block offload."""
 
     hisparse_host_block_stride: int | None = None
     """Physical bytes between consecutive HiSparse host blocks."""
@@ -1506,7 +1601,16 @@ class KVCacheConfig:
         """Number of blocks addressable by the pool backing ``tensor``."""
         if not tensor.host_resident:
             return self.num_blocks
-        assert self.hisparse_host_num_blocks is not None
+        assert self.host_num_blocks is not None
+        return self.host_num_blocks
+
+    @property
+    def host_num_blocks(self) -> int | None:
+        """Capacity of the one configured host pool, independent of GPU IDs."""
+        if self.direct_host_num_blocks is not None:
+            if self.hisparse_host_num_blocks is not None:
+                raise ValueError("Direct host KV and HiSparse cannot share a layout")
+            return self.direct_host_num_blocks
         return self.hisparse_host_num_blocks
 
     @property

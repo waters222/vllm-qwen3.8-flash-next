@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -163,6 +164,29 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
+        self._prefill_moe_chunk_size = (
+            2048
+            if os.environ.get("VLLM_FLASH_TP4_PREFILL_CHUNKS", "0") == "1"
+            and os.environ.get("VLLM_FLASH_TP4_MARLIN_K32", "0") == "1"
+            and parallel_config.tensor_parallel_size == 4
+            else 0
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        chunk = self._prefill_moe_chunk_size
+        if not chunk or hidden_states.shape[0] <= chunk:
+            return super().forward(hidden_states, already_sequence_parallel)
+        output = torch.empty_like(hidden_states)
+        for start in range(0, hidden_states.shape[0], chunk):
+            end = start + chunk
+            output[start:end].copy_(
+                super().forward(hidden_states[start:end], already_sequence_parallel)
+            )
+        return output
 
 
 class Qwen4ExpDecoderLayer(nn.Module):

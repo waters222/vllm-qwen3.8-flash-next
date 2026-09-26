@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
 from functools import partial
 from itertools import accumulate
 from types import SimpleNamespace
@@ -1508,6 +1508,88 @@ def _make_conv_metadata(
         num_spec_decodes=num_spec_reqs,
     )
     return metadata, token_offset
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="checkpoint needs CUDA")
+@pytest.mark.parametrize("state_layout", ["SD", "DS"])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_ple_checkpoint_preserves_forward_and_exports_prefix(
+    monkeypatch, state_layout, mixed
+):
+    """The owner exports raw prefix history without altering any running state."""
+    import vllm.models.qwen4_exp.nvidia.ple_layer as owner
+    from vllm.model_executor.layers.mamba.ops.flash_next_prefill_checkpoint import (
+        build_prefill_checkpoint,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    case = _ConvBatchCase(
+        spec_query_lens=(5,) if mixed else (),
+        num_accepted=(3,) if mixed else (),
+        prefill_query_lens=(2048,), channels=10240, spec_query_len=5,
+    )
+    raw, total = _make_conv_metadata(case, device)
+    values = {
+        field.name: None for field in fields(PleShortConvAttentionMetadata)
+        if field.default is MISSING and field.default_factory is MISSING
+    }
+    values.update(vars(raw))
+    metadata = PleShortConvAttentionMetadata(**values)
+    offsets = torch.tensor([0, 5, 2053] if mixed else [0, 2048], dtype=torch.int32)
+    common = SimpleNamespace(
+        query_start_loc_cpu=offsets, query_start_loc=offsets.to(device),
+        seq_lens_cpu_upper_bound=torch.tensor([100, 2048] if mixed else [2048]),
+        block_table_tensor=torch.tensor(
+            [[1, 1, 1], [2, 60, 3]] if mixed else [[1, 60, 2]],
+            dtype=torch.int32, device=device,
+        ),
+    )
+    plan = build_prefill_checkpoint(
+        common,
+        SimpleNamespace(num_prefill_checkpoint_blocks=1, block_size=944,
+                        prefill_checkpoint_alignment=1),
+        SimpleNamespace(cache_config=SimpleNamespace(prefix_match_unit=None),
+                        speculative_config=SimpleNamespace(
+                            use_eagle_block_drop=lambda: True)),
+        [1] if mixed else [0], torch.tensor([0, 2048], dtype=torch.int32),
+    )
+    rng, _, state, weights = _make_conv_case(
+        device, 1729, case.channels, 4, 3, state_layout, 5
+    )
+    initial = state.clone()
+    inputs = torch.randn(total, case.channels, device=device,
+                         dtype=torch.bfloat16, generator=rng)
+    input_before = inputs.clone()
+    residual = torch.randn_like(inputs)
+    module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(module)
+    module.prefix = "checkpoint-test"
+    module.conv_state_len = 9
+    module.num_spec_tokens = 4
+    module.short_conv_dilation = 3
+    module.conv1d = nn.Conv1d(case.channels, case.channels, 4,
+                            groups=case.channels, bias=False,
+                            device=device, dtype=torch.bfloat16)
+    module.conv1d.weight.data.copy_(weights.unsqueeze(1))
+    monkeypatch.setattr(owner, "is_conv_state_dim_first", lambda: state_layout == "DS")
+    monkeypatch.setattr(owner, "get_forward_context", lambda: SimpleNamespace(
+        attn_metadata={module.prefix: metadata}))
+
+    def run(checkpoint):
+        state.copy_(initial)
+        metadata.prefill_checkpoint = checkpoint
+        module.kv_cache = (state.transpose(-1, -2) if state_layout == "SD" else state,)
+        result = residual.clone()
+        module._short_conv(inputs, result)
+        return result, state.clone()
+
+    control_output, expected = run(None)
+    actual_output, actual = run(plan)
+    end = 949 if mixed else 944
+    expected[60, :, :9] = inputs[end - 9:end].T
+    assert torch.equal(actual_output, control_output)
+    assert torch.equal(actual, expected)
+    assert torch.equal(inputs, input_before)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused conv needs CUDA")

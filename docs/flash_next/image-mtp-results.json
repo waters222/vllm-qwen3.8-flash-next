@@ -1,0 +1,294 @@
+{
+  "rows": [
+    {
+      "concurrency": 2,
+      "workload": "text16k",
+      "images_per_request": 0,
+      "prompt_tokens_per_request": [
+        15149,
+        15149
+      ],
+      "visual_tokens_per_request": 0,
+      "prefill_tokens_per_second": 3486.9269204036127,
+      "prefill_tokens_per_second_range": [
+        3371.8104394874736,
+        3633.298591785392
+      ],
+      "batch_ttft_seconds": 8.689026380998257,
+      "tg_post_first_tokens_per_second": 98.402775839335,
+      "tg_after_all_first_tokens_per_second": 124.41432820948172,
+      "tg_after_all_first_tokens_per_second_range": [
+        123.79230471751734,
+        126.530972774645
+      ],
+      "processor_batch_ms": 0,
+      "encoder_batch_gpu_ms": 0,
+      "peak_allocated_gib": 22.522366523742676,
+      "min_cuda_unreserved_mib": 125,
+      "min_allocator_unused_reserved_mib": 524.9208984375,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        2,
+        2,
+        2
+      ],
+      "mtp_draft_acceptance_rate": 0.26534719892653474,
+      "mtp_mean_acceptance_length": 2.061388795706139
+    },
+    {
+      "concurrency": 2,
+      "workload": "images2",
+      "images_per_request": 2,
+      "prompt_tokens_per_request": [
+        2008,
+        2008
+      ],
+      "visual_tokens_per_request": 1979,
+      "prefill_tokens_per_second": 2198.2473282116753,
+      "prefill_tokens_per_second_range": [
+        2191.523397159274,
+        2198.408040118363
+      ],
+      "batch_ttft_seconds": 1.8269099879980786,
+      "tg_post_first_tokens_per_second": 202.06294119435515,
+      "tg_after_all_first_tokens_per_second": 224.2922857221426,
+      "tg_after_all_first_tokens_per_second_range": [
+        221.2259692900954,
+        228.13262336503365
+      ],
+      "processor_batch_ms": 238.47093299991684,
+      "encoder_batch_gpu_ms": 472.4067153930664,
+      "peak_allocated_gib": 22.414191722869873,
+      "min_cuda_unreserved_mib": 125,
+      "min_allocator_unused_reserved_mib": 524.6767578125,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        2,
+        2,
+        2
+      ],
+      "mtp_draft_acceptance_rate": 0.5625330512956108,
+      "mtp_mean_acceptance_length": 3.2501322051824433
+    },
+    {
+      "concurrency": 2,
+      "workload": "images4",
+      "images_per_request": 4,
+      "prompt_tokens_per_request": [
+        3919,
+        3919
+      ],
+      "visual_tokens_per_request": 3886,
+      "prefill_tokens_per_second": 1878.2433952602096,
+      "prefill_tokens_per_second_range": [
+        1634.2706357137738,
+        1997.6048860143121
+      ],
+      "batch_ttft_seconds": 4.173048083001049,
+      "tg_post_first_tokens_per_second": 185.519275218852,
+      "tg_after_all_first_tokens_per_second": 211.58460276198664,
+      "tg_after_all_first_tokens_per_second_range": [
+        209.31746490583544,
+        220.28565962864522
+      ],
+      "processor_batch_ms": 519.8222880026151,
+      "encoder_batch_gpu_ms": 910.5921630859375,
+      "peak_allocated_gib": 22.515343189239502,
+      "min_cuda_unreserved_mib": 121,
+      "min_allocator_unused_reserved_mib": 529.0234375,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        2,
+        2,
+        2
+      ],
+      "mtp_draft_acceptance_rate": 0.5524804177545692,
+      "mtp_mean_acceptance_length": 3.209921671018277
+    },
+    {
+      "concurrency": 2,
+      "workload": "mixed4-16k",
+      "images_per_request": 4,
+      "prompt_tokens_per_request": [
+        19043,
+        19043
+      ],
+      "visual_tokens_per_request": 3886,
+      "prefill_tokens_per_second": 3036.3670072437544,
+      "prefill_tokens_per_second_range": [
+        2986.5892687095934,
+        3158.552322211719
+      ],
+      "batch_ttft_seconds": 12.543279487999826,
+      "tg_post_first_tokens_per_second": 136.10608454523307,
+      "tg_after_all_first_tokens_per_second": 214.7720257600444,
+      "tg_after_all_first_tokens_per_second_range": [
+        208.6127982750138,
+        214.8656008482066
+      ],
+      "processor_batch_ms": 490.98800699721323,
+      "encoder_batch_gpu_ms": 918.7325057983398,
+      "peak_allocated_gib": 22.52044153213501,
+      "min_cuda_unreserved_mib": 47,
+      "min_allocator_unused_reserved_mib": 603.0234375,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        2,
+        2,
+        2
+      ],
+      "mtp_draft_acceptance_rate": 0.5626984126984127,
+      "mtp_mean_acceptance_length": 3.250793650793651
+    },
+    {
+      "concurrency": 4,
+      "workload": "text16k",
+      "images_per_request": 0,
+      "prompt_tokens_per_request": [
+        15149,
+        15149,
+        15149,
+        15149
+      ],
+      "visual_tokens_per_request": 0,
+      "prefill_tokens_per_second": 3452.570850784536,
+      "prefill_tokens_per_second_range": [
+        3449.0592427434644,
+        3479.1345443578525
+      ],
+      "batch_ttft_seconds": 17.550979435000045,
+      "tg_post_first_tokens_per_second": 109.72667329028913,
+      "tg_after_all_first_tokens_per_second": 165.28980027168714,
+      "tg_after_all_first_tokens_per_second_range": [
+        163.7043721247327,
+        178.1796016264282
+      ],
+      "processor_batch_ms": 0,
+      "encoder_batch_gpu_ms": 0,
+      "peak_allocated_gib": 22.522757530212402,
+      "min_cuda_unreserved_mib": 47,
+      "min_allocator_unused_reserved_mib": 603.0234375,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        4,
+        4,
+        4
+      ],
+      "mtp_draft_acceptance_rate": 0.29535771347417006,
+      "mtp_mean_acceptance_length": 2.1814308538966802
+    },
+    {
+      "concurrency": 4,
+      "workload": "images2",
+      "images_per_request": 2,
+      "prompt_tokens_per_request": [
+        2008,
+        2008,
+        2008,
+        2008
+      ],
+      "visual_tokens_per_request": 1979,
+      "prefill_tokens_per_second": 1857.6197563125652,
+      "prefill_tokens_per_second_range": [
+        1686.8363943601119,
+        1889.450488133961
+      ],
+      "batch_ttft_seconds": 4.323812757000269,
+      "tg_post_first_tokens_per_second": 249.0405366422041,
+      "tg_after_all_first_tokens_per_second": 320.2616971887915,
+      "tg_after_all_first_tokens_per_second_range": [
+        305.4845412664814,
+        329.92511369455366
+      ],
+      "processor_batch_ms": 476.96719300438417,
+      "encoder_batch_gpu_ms": 1013.8569030761719,
+      "peak_allocated_gib": 22.516634941101074,
+      "min_cuda_unreserved_mib": 47,
+      "min_allocator_unused_reserved_mib": 602.525390625,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        4,
+        4,
+        4
+      ],
+      "mtp_draft_acceptance_rate": 0.5671007175126229,
+      "mtp_mean_acceptance_length": 3.2684028700504917
+    },
+    {
+      "concurrency": 4,
+      "workload": "images4",
+      "images_per_request": 4,
+      "prompt_tokens_per_request": [
+        3919,
+        3919,
+        3919,
+        3919
+      ],
+      "visual_tokens_per_request": 3886,
+      "prefill_tokens_per_second": 1708.5666091523626,
+      "prefill_tokens_per_second_range": [
+        1611.121766030247,
+        1854.0360953626864
+      ],
+      "batch_ttft_seconds": 9.174942267996812,
+      "tg_post_first_tokens_per_second": 214.50098836955158,
+      "tg_after_all_first_tokens_per_second": 299.1264071504164,
+      "tg_after_all_first_tokens_per_second_range": [
+        286.15529512591064,
+        299.47003480965355
+      ],
+      "processor_batch_ms": 1058.913990007568,
+      "encoder_batch_gpu_ms": 1920.725845336914,
+      "peak_allocated_gib": 22.515587329864502,
+      "min_cuda_unreserved_mib": 47,
+      "min_allocator_unused_reserved_mib": 603.0234375,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        4,
+        4,
+        4
+      ],
+      "mtp_draft_acceptance_rate": 0.5395041109969168,
+      "mtp_mean_acceptance_length": 3.158016443987667
+    },
+    {
+      "concurrency": 4,
+      "workload": "mixed4-16k",
+      "images_per_request": 4,
+      "prompt_tokens_per_request": [
+        19043,
+        19043,
+        19043,
+        19043
+      ],
+      "visual_tokens_per_request": 3886,
+      "prefill_tokens_per_second": 3049.8309357760695,
+      "prefill_tokens_per_second_range": [
+        3021.5077160022006,
+        3172.1651515545523
+      ],
+      "batch_ttft_seconds": 24.97581066099883,
+      "tg_post_first_tokens_per_second": 119.3102628464913,
+      "tg_after_all_first_tokens_per_second": 286.8821946947635,
+      "tg_after_all_first_tokens_per_second_range": [
+        280.264534200304,
+        287.04649854872787
+      ],
+      "processor_batch_ms": 1534.3452969973441,
+      "encoder_batch_gpu_ms": 1999.0205459594727,
+      "peak_allocated_gib": 22.53518009185791,
+      "min_cuda_unreserved_mib": 71,
+      "min_allocator_unused_reserved_mib": 577.0234375,
+      "allocation_retries": 0,
+      "observed_peak_running": [
+        4,
+        4,
+        4
+      ],
+      "mtp_draft_acceptance_rate": 0.5512770393536617,
+      "mtp_mean_acceptance_length": 3.2051081574146467
+    }
+  ],
+  "limits": "Diagram fixtures, event hooks included; no cache/numerical qualification.",
+  "source_sha256": "5b35ce8d6d4f294334716b83854341e7abac79c41e97dd6dbe0b08744ab6bb6a"
+}

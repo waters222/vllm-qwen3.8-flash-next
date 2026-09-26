@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
+from math import isfinite
+from time import monotonic
 
 from typing_extensions import override
 
@@ -47,7 +49,17 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        idle_ttl_seconds: float | None = None,
     ):
+        if idle_ttl_seconds is not None and (
+            type(idle_ttl_seconds) not in (int, float)
+            or not isfinite(idle_ttl_seconds)
+            or idle_ttl_seconds <= 0
+        ):
+            raise ValueError("idle_ttl_seconds must be a finite positive number")
+        self.idle_ttl_seconds = idle_ttl_seconds
+        self._idle_deadlines: OrderedDict[OffloadKey, float] = OrderedDict()
+        self._expired_chunks = 0
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
         self._num_allocated_chunks: int = 0
@@ -73,6 +85,40 @@ class CPUOffloadingManager(OffloadingManager):
         )
 
     # --- chunk pool ---
+
+    def _mark_idle(self, key: OffloadKey) -> None:
+        if self.idle_ttl_seconds is not None:
+            self._idle_deadlines[key] = monotonic() + self.idle_ttl_seconds
+            self._idle_deadlines.move_to_end(key)
+
+    def _expire_key(self, key: OffloadKey, now: float) -> bool:
+        deadline = self._idle_deadlines.get(key)
+        if deadline is None or deadline > now:
+            return False
+        chunk = self._policy.get(key)
+        if chunk is None or chunk.ref_cnt != 0:
+            raise RuntimeError(
+                "CPU cache expiry found a missing or in-flight idle chunk"
+            )
+        self._policy.remove(key)
+        del self._idle_deadlines[key]
+        self._num_evictable_cache_chunks -= 1
+        self._free_chunk(chunk)
+        self._expired_chunks += 1
+        if self.events is not None:
+            self.events.append(
+                OffloadingEvent(keys=[key], medium=self.medium, removed=True)
+            )
+        return True
+
+    def _expire_idle(self) -> None:
+        if not self._idle_deadlines:
+            return
+        now = monotonic()
+        while self._idle_deadlines:
+            key = next(iter(self._idle_deadlines))
+            if not self._expire_key(key, now):
+                break
 
     def _get_num_free_chunks(self) -> int:
         return len(self._free_list) + self._num_chunks - self._num_allocated_chunks
@@ -128,10 +174,13 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        self._expire_idle()
         return RequestOffloadingContext()
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if self.idle_ttl_seconds is not None:
+            self._expire_key(key, monotonic())
         chunk = self._policy.get(key)
         if chunk is None:
             return LookupResult.MISS
@@ -151,6 +200,7 @@ class CPUOffloadingManager(OffloadingManager):
             assert chunk is not None, f"Chunk {key!r} not found in cache"
             assert chunk.is_ready, f"Chunk {key!r} is not ready for reading"
             if chunk.ref_cnt == 0:
+                self._idle_deadlines.pop(key, None)
                 self._policy.mark_non_evictable(key)
                 self._num_evictable_cache_chunks -= 1  # ref_cnt 0 -> 1
                 assert self._num_evictable_cache_chunks >= 0
@@ -160,6 +210,13 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        if self.idle_ttl_seconds is not None:
+            for key in keys:
+                # Native scheduling touches an offered hit before prepare_load.
+                # Do not invalidate that offer if its deadline just elapsed.
+                chunk = self._policy.get(key)
+                if chunk is not None and chunk.ref_cnt == 0:
+                    self._mark_idle(key)
         self._policy.touch(keys, req_context)
 
     @override
@@ -174,6 +231,7 @@ class CPUOffloadingManager(OffloadingManager):
             if chunk.ref_cnt == 0:
                 self._num_evictable_cache_chunks += 1  # ref_cnt 1 -> 0
                 self._policy.mark_evictable(key)
+                self._mark_idle(key)
 
     @override
     def prepare_store(
@@ -181,6 +239,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        self._expire_idle()
         if self.counts is not None:
             num_keys = len(keys)
             self._record_accesses(keys)
@@ -219,6 +278,7 @@ class CPUOffloadingManager(OffloadingManager):
             assert self._num_evictable_cache_chunks >= 0
 
             for key, chunk in evicted:
+                self._idle_deadlines.pop(key, None)
                 self._free_chunk(chunk)
                 to_evict.append(key)
 
@@ -266,6 +326,7 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_write_pending_chunks -= 1
                     self._num_evictable_cache_chunks += 1
                     self._policy.mark_evictable(key)
+                    self._mark_idle(key)
                     stored_keys.append(key)
         else:
             for key in keys:
@@ -292,6 +353,7 @@ class CPUOffloadingManager(OffloadingManager):
         # flushes in-flight load job IDs to the workers before any new stores
         # can begin, preventing a cross-direction data race on reused offload chunk IDs.
         self._policy.clear()
+        self._idle_deadlines.clear()
         self._num_evictable_cache_chunks = 0
         self._num_write_pending_chunks = 0
 
@@ -305,7 +367,13 @@ class CPUOffloadingManager(OffloadingManager):
             self.events.clear()
 
     def get_stats(self) -> OffloadingConnectorStats | None:
+        self._expire_idle()
         stats = OffloadingConnectorStats()
+        if self.idle_ttl_seconds is not None:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_CACHE_EXPIRED_CHUNKS, self._expired_chunks
+            )
+            self._expired_chunks = 0
 
         # Compute cache usage.
         num_used = (

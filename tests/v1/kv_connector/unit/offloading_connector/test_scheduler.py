@@ -195,9 +195,10 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
 
 def _make_partial_tail_request(
     scheduler: OffloadingConnectorScheduler,
+    request_id: str = "req",
 ) -> MagicMock:
     request = MagicMock()
-    request.request_id = "req"
+    request.request_id = request_id
     request.kv_transfer_params = None
     request.num_prompt_tokens = 30
     request.num_tokens = 30
@@ -425,6 +426,247 @@ def test_lookup_cap_stops_at_authoritative_prefix_boundary():
 
     assert (tokens, load_async) == (20, True)
     assert scheduler._req_status["req"].partial_tail_boundary == 20
+
+
+@pytest.mark.parametrize("readers", [2, 4, 8])
+def test_shared_source_defers_followers_then_misses_if_required_state_expired(
+    monkeypatch, readers
+):
+    """A surviving partial checkpoint cannot resurrect an expired required prefix."""
+    clock = [0.0]
+    monkeypatch.setattr("vllm.v1.kv_offload.cpu.manager.monotonic", lambda: clock[0])
+    config = _make_vllm_config(tensor_parallel_size=4)
+    config.cache_config.prefix_match_unit = 4
+    config.speculative_config = None
+    kv_config = _make_mamba_hybrid_kv_cache_config()
+    scheduler = OffloadingConnectorScheduler(
+        MockOffloadingSpec(build_offloading_config(config, kv_config)),
+        config,
+        kv_config,
+    )
+    manager = CPUOffloadingManager(num_chunks=32, idle_ttl_seconds=3600)
+    scheduler.manager = manager
+    requests = [
+        _make_partial_tail_request(scheduler, f"reader-{i}") for i in range(readers)
+    ]
+    state = scheduler._req_status[requests[0].request_id]
+    state.update_offload_keys()
+    keys = [key for group in state.group_states for key in group.offload_keys]
+    keys += [scheduler._make_boundary_key(requests[0], group, 28) for group in (0, 1)]
+    stored = manager.prepare_store(list(dict.fromkeys(keys)), state.req_context)
+    assert stored is not None
+    manager.complete_store(stored.keys_to_store, state.req_context)
+    pinned = None
+    for request in requests:
+        request.skip_reading_prefix_cache = False
+    for i, request in enumerate(requests[:1]):
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (28, True)
+        scheduler.update_state_after_alloc(
+            request,
+            KVCacheBlocks(
+                (
+                    [KVCacheBlock(10 * i + 1), KVCacheBlock(10 * i + 2)],
+                    [KVCacheBlock(0, is_null=True), KVCacheBlock(10 * i + 3)],
+                )
+            ),
+            num_external_tokens=28,
+        )
+        [(job_id, job)] = scheduler._jobs.items()
+        assert job.pending_count == 4
+        if pinned is None:
+            pinned = {key: manager._policy.get(key) for key in job.keys}
+            assert pinned
+            # Native complete-prefix coalescing defers duplicate loads.
+            for follower in requests[1:]:
+                assert scheduler.get_num_new_matched_tokens(follower, 0) == (
+                    None,
+                    False,
+                )
+                assert not scheduler._req_status[follower.request_id].transfer_jobs
+        assert set(job.keys) == set(pinned)
+        for rank in range(4):
+            clock[0] += 3601
+            manager._expire_idle()
+            assert all(
+                manager._policy.get(key) is chunk and chunk.ref_cnt == 1
+                for key, chunk in pinned.items()
+            )
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs={job_id: 1}
+                    )
+                )
+            )
+            outstanding = rank < 3
+            assert bool(scheduler._jobs) == outstanding
+            assert job.pending_count == 3 - rank
+            assert all(
+                manager._policy.get(key) is chunk and chunk.ref_cnt == int(outstanding)
+                for key, chunk in pinned.items()
+            )
+    assert not scheduler._jobs
+    assert all(not state.transfer_jobs for state in scheduler._req_status.values())
+    # The leader's loaded chunks survived; an unpinned earlier group checkpoint
+    # expired during the wait. Native lookup must miss, not reuse partial state.
+    for follower in requests[1:]:
+        assert scheduler.get_num_new_matched_tokens(follower, 0) == (0, False)
+        assert not scheduler._req_status[follower.request_id].transfer_jobs
+    assert all(
+        manager.lookup(key, state.req_context) is LookupResult.HIT for key in pinned
+    )
+    clock[0] += 3600
+    assert all(
+        manager.lookup(key, state.req_context) is LookupResult.MISS for key in pinned
+    )
+    assert manager._get_num_free_chunks() == 32
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("final_rank_fails", [False, True])
+def test_expired_follower_misses_while_leader_load_remains_pinned(
+    monkeypatch, workers, final_rank_fails
+):
+    """A late branch cannot load expired state or release another branch's source."""
+    clock = [0.0]
+    monkeypatch.setattr("vllm.v1.kv_offload.cpu.manager.monotonic", lambda: clock[0])
+    config = _make_vllm_config(tensor_parallel_size=workers)
+    config.cache_config.prefix_match_unit = 4
+    config.speculative_config = None
+    kv_config = _make_mamba_hybrid_kv_cache_config()
+    scheduler = OffloadingConnectorScheduler(
+        MockOffloadingSpec(build_offloading_config(config, kv_config)),
+        config,
+        kv_config,
+    )
+    manager = CPUOffloadingManager(num_chunks=32, idle_ttl_seconds=3600)
+    scheduler.manager = manager
+    leader = _make_partial_tail_request(scheduler, "leader")
+    follower = _make_partial_tail_request(scheduler, "follower")
+    follower.block_hashes[-1] = BlockHash(b"private-follower-tail")
+    for request in (leader, follower):
+        request.skip_reading_prefix_cache = False
+        state = scheduler._req_status[request.request_id]
+        state.update_offload_keys()
+        keys = list(
+            dict.fromkeys(
+                [key for group in state.group_states for key in group.offload_keys]
+                + [scheduler._make_boundary_key(request, group, 28) for group in (0, 1)]
+            )
+        )
+        store = manager.prepare_store(keys, state.req_context)
+        assert store is not None
+        manager.complete_store(store.keys_to_store, state.req_context)
+
+    assert scheduler.get_num_new_matched_tokens(leader, 0) == (28, True)
+    scheduler.update_state_after_alloc(
+        leader,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+            )
+        ),
+        num_external_tokens=28,
+    )
+    [(job_id, job)] = scheduler._jobs.items()
+    assert job.pending_count == workers
+    pinned = {key: manager._policy.get(key) for key in job.keys}
+    assert all(chunk is not None and chunk.ref_cnt == 1 for chunk in pinned.values())
+
+    clock[0] = 3601
+    manager._expire_idle()
+    assert manager._expired_chunks > 0
+    assert scheduler.get_num_new_matched_tokens(follower, 0) == (0, False)
+    assert not scheduler._req_status["follower"].transfer_jobs
+    assert scheduler._jobs == {job_id: job}
+    for count in range(workers):
+        assert all(
+            manager._policy.get(key) is chunk and chunk.ref_cnt == 1
+            for key, chunk in pinned.items()
+        )
+        if final_rank_fails and count == workers - 1:
+            from tests.v1.kv_connector.unit.offloading_connector.test_worker import (
+                _make_worker,
+            )
+            from vllm.v1.kv_offload.base import TransferResult
+
+            worker, _ = _make_worker(
+                KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+            )
+            worker._load_jobs[job_id] = leader.request_id
+            worker.worker.get_finished.return_value = [
+                TransferResult(job_id=job_id, success=False)
+            ]
+            with pytest.raises(AssertionError):
+                worker.get_finished(set())
+            assert worker.build_connector_worker_meta() is None
+            assert worker._load_jobs == {job_id: leader.request_id}
+            assert scheduler._jobs == {job_id: job} and job.pending_count == 1
+            clock[0] += 3601
+            manager._expire_idle()
+            assert all(
+                manager._policy.get(key) is chunk and chunk.ref_cnt == 1
+                for key, chunk in pinned.items()
+            )
+            # Native failure is fatal; do not invent a successful final ack or
+            # claim that the engine can recover and reuse a partial transfer.
+            return
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_jobs={job_id: 1}
+                )
+            )
+        )
+        assert bool(scheduler._jobs) == (count + 1 < workers)
+
+    assert all(chunk.ref_cnt == 0 for chunk in pinned.values())
+    assert not scheduler._req_status["leader"].transfer_jobs
+    assert scheduler.get_num_new_matched_tokens(follower, 0) == (0, False)
+    context = scheduler._req_status["leader"].req_context
+    assert all(manager.lookup(key, context) is LookupResult.HIT for key in pinned)
+    # A completed load starts a new idle interval, not the original store's TTL.
+    clock[0] = 7201
+    assert all(manager.lookup(key, context) is LookupResult.MISS for key in pinned)
+    assert manager._get_num_free_chunks() == 32
+
+
+@pytest.mark.parametrize(
+    "prompt_tokens,local_tokens,cap,expected",
+    [
+        (30, 0, 16, 16),
+        (30, 0, 15, 0),
+        (32, 0, 32, 16),
+        (33, 0, 32, 32),
+        (49, 16, 16, 16),
+        (30, 0, None, 16),
+    ],
+)
+def test_recurrent_cold_hit_keeps_aligned_resident_bound(
+    prompt_tokens, local_tokens, cap, expected
+):
+    """Reserve the final prompt token, not a token from an earlier RAM bound."""
+    config = _make_vllm_config()
+    config.speculative_config = None
+    kv_config = _make_mamba_hybrid_kv_cache_config()
+    scheduler = OffloadingConnectorScheduler(
+        MockOffloadingSpec(build_offloading_config(config, kv_config)),
+        config,
+        kv_config,
+    )
+    request = _make_partial_tail_request(scheduler)
+    request.num_prompt_tokens = request.num_tokens = prompt_tokens
+    request.block_hashes = [
+        BlockHash(f"h{i}".encode()) for i in range(prompt_tokens // 16)
+    ]
+    request.skip_reading_prefix_cache = False
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    assert not scheduler.config.supports_partial_tail
+
+    assert scheduler.get_num_new_matched_tokens(
+        request, local_tokens, max_num_new_tokens=cap
+    ) == (expected, bool(expected))
 
 
 def test_recurrent_group_unhashed_block_does_not_truncate_load_boundary():

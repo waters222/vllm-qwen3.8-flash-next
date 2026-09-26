@@ -241,6 +241,36 @@ class EngineCore:
 
         self._idle_state_callbacks: list[Callable] = []
 
+        self.flash_session_transactions = None
+        if int(os.environ.get("VLLM_FLASH_SESSION_SWAP_BYTES", "0")) > 0:
+            from vllm.v1.core.flash_session_allocator import FlashSessionAllocator
+            from vllm.v1.core.flash_session_transactions import FlashSessionTransactions
+            from vllm.v1.core.sched.output import NewRequestData
+
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.data_parallel_size != 1
+                or parallel.decode_context_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or self.scheduler.connector is not None
+                or self.scheduler.ec_connector is not None
+            ):
+                raise ValueError(
+                    "unsupported distributed configuration for session swap"
+                )
+            self.flash_session_transactions = FlashSessionTransactions(
+                self,
+                FlashSessionAllocator(self.scheduler.kv_cache_manager),
+                RequestStatus,
+                PauseState.PAUSED_ALL,
+                NewRequestData,
+                ttl_seconds=int(
+                    os.environ.get("VLLM_FLASH_SESSION_SWAP_TTL_SECONDS", "3600")
+                ),
+                unpaused=PauseState.UNPAUSED,
+            )
+            self.scheduler.flash_session_transactions = self.flash_session_transactions
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -486,6 +516,8 @@ class EngineCore:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
+        if self.flash_session_transactions is not None:
+            self.flash_session_transactions.automatic_tick()
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -619,6 +651,8 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
+        if self.flash_session_transactions is not None:
+            self.flash_session_transactions.observe_hot_sessions()
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
@@ -626,6 +660,8 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+        if self.flash_session_transactions is not None:
+            self.flash_session_transactions.automatic_tick()
 
     def step_with_batch_queue(
         self,
@@ -775,6 +811,7 @@ class EngineCore:
         self.model_executor.profile(is_start, profile_prefix)
 
     def reset_mm_cache(self):
+        self._require_no_retained_sessions("reset_mm_cache")
         # NOTE: Since this is mainly for debugging, we don't attempt to
         # re-sync the internal caches (P0 sender, P1 receiver)
         if self.scheduler.has_unfinished_requests():
@@ -792,6 +829,7 @@ class EngineCore:
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        self._require_no_retained_sessions("reset_prefix_cache")
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
@@ -803,6 +841,7 @@ class EngineCore:
         stale vision embeddings computed with old weights are not reused.
         Clears both the scheduler's cache manager and the GPU model runner's cache.
         """
+        self._require_no_retained_sessions("reset_encoder_cache")
         # NOTE: Since this is mainly for debugging, we don't attempt to
         # re-sync the internal caches (P0 sender, P1 receiver)
         if self.scheduler.has_unfinished_requests():
@@ -859,6 +898,12 @@ class EngineCore:
         if mode == "wait":
             raise ValueError("'wait' mode can't be used in inproc-engine mode")
 
+        if clear_cache:
+            self._require_no_retained_sessions("pause_scheduler(clear_cache=True)")
+
+        if self.flash_session_transactions is not None:
+            self.flash_session_transactions.automatic_pause = False
+
         if mode == "abort":
             self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
 
@@ -870,11 +915,55 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        if self.flash_session_transactions is not None:
+            self.flash_session_transactions.assert_can_resume()
+            self.flash_session_transactions.automatic_pause = False
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
+
+    def flash_session_swap(
+        self,
+        operation: str,
+        request_id: str = "",
+        client_index: int = 0,
+        generation: int | None = None,
+    ) -> Any:
+        """Internal utility API; requires keep/no-clear pause for state transfers."""
+        transactions = self.flash_session_transactions
+        if transactions is None:
+            raise ValueError("Flash session swapping is disabled")
+        if operation == "status":
+            return [
+                {"key": record.key, "phase": record.phase}
+                for record in transactions.records.values()
+            ]
+        if operation == "stats":
+            return transactions.stats()
+        if operation == "lookup":
+            return transactions.lookup(request_id, client_index, generation)
+        if operation == "describe":
+            return transactions.describe(request_id, client_index)
+        if operation == "expire_idle":
+            return transactions.expire_idle()
+        if operation == "evict_lru":
+            return transactions.evict_lru()
+        if operation == "suspend":
+            return transactions.suspend(request_id, client_index)
+        if generation is None:
+            raise ValueError("session operation requires its current generation")
+        if operation not in ("restore", "complete_suspend", "complete_restore"):
+            raise ValueError("unknown session transaction operation")
+        return getattr(transactions, operation)(request_id, client_index, generation)
 
     def is_scheduler_paused(self) -> bool:
         """Return whether the scheduler is in any pause state."""
         return self.scheduler.pause_state != PauseState.UNPAUSED
+
+    def _require_no_retained_sessions(self, operation: str) -> None:
+        transactions = self.flash_session_transactions
+        if transactions is not None and transactions.records:
+            raise RuntimeError(
+                f"{operation} requires restoring or cancelling retained sessions first"
+            )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
         """Put the engine to sleep at the specified level.
@@ -889,6 +978,8 @@ class EngineCore:
                 documentation of pause_scheduler method.
         """
 
+        if level >= 1:
+            self._require_no_retained_sessions("sleep")
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
@@ -968,9 +1059,12 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
+        if method not in ("flash_session_swap", "synchronize_device"):
+            self._require_no_retained_sessions("collective_rpc")
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
     def set_weight_version(self, weight_version: str) -> None:
+        self._require_no_retained_sessions("set_weight_version")
         self._weight_version = weight_version
 
     def get_weight_version(self) -> str:
@@ -1433,6 +1527,10 @@ class EngineCoreProc(EngineCore):
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
+            if self.flash_session_transactions is not None:
+                self.flash_session_transactions.automatic_tick()
+                if self.has_work():
+                    break
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
@@ -1442,7 +1540,13 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                session_poll = (
+                    self.flash_session_transactions is not None
+                    and bool(self.flash_session_transactions.records)
+                )
+                req = self.input_queue.get(
+                    block=block, timeout=1.0 if block and session_poll else None
+                )
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1937,6 +2041,12 @@ class EngineCoreProc(EngineCore):
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
             engine._finish_pause(clear_cache)
             future.set_result(None)
+
+        if clear_cache:
+            self._require_no_retained_sessions("pause_scheduler(clear_cache=True)")
+
+        if self.flash_session_transactions is not None:
+            self.flash_session_transactions.automatic_pause = False
 
         if mode == "abort":
             aborted_reqs = self.scheduler.finish_requests(

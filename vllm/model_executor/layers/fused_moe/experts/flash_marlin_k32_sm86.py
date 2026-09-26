@@ -35,6 +35,9 @@ def validate_config(config, environ=None):
     if mtp_flag not in ("0", "1"):
         raise ValueError("VLLM_FLASH_TP4_MTP_Q8 must be 0 or 1")
     spec = config.speculative_config
+    chunks = env.get("VLLM_FLASH_TP4_PREFILL_CHUNKS", "0")
+    if chunks not in ("0", "1"):
+        raise ValueError("VLLM_FLASH_TP4_PREFILL_CHUNKS must be 0 or 1")
     speculation_ok = spec is None and mtp_flag == "0"
     if mtp_flag == "1":
         speculation_ok = (
@@ -53,7 +56,9 @@ def validate_config(config, environ=None):
         and not parallel.enable_expert_parallel
         and speculation_ok
         and config.lora_config is None
-        and config.scheduler_config.max_num_batched_tokens <= 2048
+        and config.scheduler_config.max_num_batched_tokens <= (
+            8192 if chunks == "1" else 2048
+        )
         and env.get("VLLM_FLASH_TP4_CHUNKED_REPACK", "0") == "0"
     ):
         raise ValueError("K32 requires TP4/PP1/noEP, no MTP or explicit Q8 MTP1--4")

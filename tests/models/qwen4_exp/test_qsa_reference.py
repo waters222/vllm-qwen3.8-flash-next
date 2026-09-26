@@ -24,6 +24,79 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("enabled,graph", [(False, False), (True, False), (True, True)])
+def test_qsa_prefill_metadata_cache_expires_with_forward_context(
+    monkeypatch, enabled, graph
+):
+    """Reuse exact reads across layers, never across target/draft forwards."""
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.qwen4_exp.nvidia.qsa import _qsa_prefill_host_metadata
+
+    starts = torch.tensor([0, 64, 128])
+    lengths = torch.tensor([192, 256])
+    metadata = SimpleNamespace(query_start_loc=starts, seq_lens=lengths)
+    layer = SimpleNamespace(_qsa_prefill_metadata_cache=enabled)
+    calls = []
+    original = torch.Tensor.tolist
+
+    def observed(tensor):
+        calls.append(tensor.data_ptr())
+        return original(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", observed)
+    mode = CUDAGraphMode.FULL if graph else CUDAGraphMode.NONE
+    with override_forward_context(
+        ForwardContext({}, {}, {}, cudagraph_runtime_mode=mode)
+    ):
+        assert _qsa_prefill_host_metadata(layer, metadata, 2) == (
+            [0, 64, 128],
+            [192, 256],
+        )
+        assert _qsa_prefill_host_metadata(layer, metadata, 2) == (
+            [0, 64, 128],
+            [192, 256],
+        )
+    assert len(calls) == (2 if enabled and not graph else 4)
+    lengths.add_(7)
+    with override_forward_context(
+        ForwardContext({}, {}, {}, cudagraph_runtime_mode=mode)
+    ):
+        assert _qsa_prefill_host_metadata(layer, metadata, 2) == (
+            [0, 64, 128],
+            [199, 263],
+        )
+    assert len(calls) == (4 if enabled and not graph else 6)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("fallback", ["disabled", "resident", "mixed", "capacity"])
+def test_verify_staging_fallback_leaves_output_untouched(fallback):
+    """An ineligible request must retain the existing attention path."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_verify_staging import try_verify_staging
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    backing = torch.zeros((2, 1, 472, 512), dtype=torch.bfloat16, pin_memory=True)
+    cache = get_accelerator_view_from_cpu_tensor(backing)
+    query = torch.zeros((5, 6, 256), dtype=torch.bfloat16, device="cuda")
+    indices = torch.full((5, 2052), -1, dtype=torch.int32, device="cuda")
+    output = torch.full_like(query, 17)
+    layer = SimpleNamespace(
+        _qsa_verify_staging=fallback != "disabled",
+        _qsa_kv_offload=fallback != "resident",
+        _qsa_stage_arena_bytes=0 if fallback == "capacity" else 2**20,
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=5,
+        max_query_len=4 if fallback == "mixed" else 5,
+        seq_lens=torch.ones(1, device="cuda", dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 5], device="cuda", dtype=torch.int32),
+        block_table=torch.ones((1, 1), device="cuda", dtype=torch.int32),
+    )
+    assert not try_verify_staging(layer, query, cache, indices, metadata, output)
+    assert torch.equal(output, torch.full_like(output, 17))
+
+
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1035,6 +1108,253 @@ def test_qsa_sparse_paged_attention_correctness(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    "query_counts", [(64,), (64, 64), (64, 5, 65), (5, 64, 5), (65, 5, 64, 5), (5, 5)]
+)
+@pytest.mark.parametrize("arena_pages", [1, 8])
+@pytest.mark.parametrize("cache_metadata", [False, True])
+def test_qsa_multi_request_staging_preserves_private_suffix_and_ram_bytes(
+    monkeypatch, query_counts, arena_pages, cache_metadata
+):
+    """Exercise the real dispatch/kernels with shared pages and private suffixes."""
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionImpl
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    torch.manual_seed(173)
+    page_size, head_dim, heads, columns = 32, 256, 6, 63
+    lengths = [128 + count for count in query_counts]
+    pages = math.ceil(max(lengths) / page_size)
+    tables = [
+        [1, *range(2 + i * (pages - 1), 2 + (i + 1) * (pages - 1))]
+        for i in range(len(query_counts))
+    ]
+    backing = torch.randn(
+        2 + len(query_counts) * (pages - 1),
+        1,
+        page_size,
+        2 * head_dim,
+        dtype=torch.bfloat16,
+        pin_memory=True,
+    )
+    before = backing.view(torch.uint8).clone()
+    cache = get_accelerator_view_from_cpu_tensor(backing)
+    total = sum(query_counts)
+    query = torch.randn(total, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    positions = torch.cat(
+        [torch.arange(128, length, device="cuda") for length in lengths]
+    )
+    selected = torch.cat(
+        [
+            torch.arange(31, device="cuda").expand(total, -1),
+            positions[:, None] - torch.arange(31, -1, -1, device="cuda"),
+        ],
+        dim=1,
+    ).int()
+    packed = torch.cat(
+        [selected, torch.full((total, 1), columns, device="cuda", dtype=torch.int32)],
+        dim=1,
+    )
+    table = torch.tensor(tables, dtype=torch.int32, device="cuda")
+    counts = torch.tensor(query_counts, device="cuda", dtype=torch.int32)
+    offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)]).int()
+    request_ids = torch.repeat_interleave(
+        torch.arange(len(query_counts), device="cuda", dtype=torch.int32), counts
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=total,
+        query_start_loc=offsets,
+        seq_lens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        block_table=table,
+    )
+    layer = SimpleNamespace(
+        _qsa_kv_offload=True,
+        _qsa_stage_min_rows=64,
+        _qsa_stage_all_prefill=False,
+        _qsa_stage_arena_bytes=arena_pages * page_size * 2 * head_dim * 2,
+        topk_indices_buffer=packed,
+    )
+    impl = SimpleNamespace(
+        alibi_slopes=None,
+        sinks=None,
+        sliding_window=(-1, -1),
+        head_size=head_dim,
+    )
+    calls = []
+    native = qsa_ops.qsa_sparse_paged_attention_staged
+
+    def record(*args, **kwargs):
+        calls.append((args[4].tolist(), args[3].tolist(), args[6].data_ptr()))
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(qsa_ops, "qsa_sparse_paged_attention_staged", record)
+
+    def forward():
+        result = torch.empty_like(query)
+        return Qwen4ExpQSAFlashAttentionImpl.forward_qsa(
+            impl,
+            layer,
+            query,
+            None,
+            None,
+            cache,
+            metadata,
+            result,
+            request_ids,
+            max(query_counts) > 5,
+        )
+
+    baseline = forward()
+    calls.clear()
+    layer._qsa_stage_all_prefill = True
+    layer._qsa_prefill_metadata_cache = cache_metadata
+    with override_forward_context(ForwardContext({}, {}, {})):
+        first = forward()
+        calls.clear()
+        actual = forward()
+    assert torch.equal(first, actual)
+    eligible = [i for i, count in enumerate(query_counts) if count >= 64]
+    assert len(calls) == len(eligible)
+    starts = offsets.tolist()
+    for call, request in zip(calls, eligible):
+        assert call[0] == list(range(starts[request], starts[request + 1]))
+        assert call[1] == tables[request]
+    assert len({call[2] for call in calls}) <= 1
+    reference_cache = backing.to("cuda")
+    keys, values = reference_cache.transpose(1, 2).split(head_dim, dim=-1)
+    expected = _qsa_sparse_paged_attention_reference(
+        query, keys, values, selected, table, request_ids, head_dim**-0.5
+    )
+    torch.testing.assert_close(baseline, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.cuda.synchronize()
+    assert torch.equal(backing.view(torch.uint8), before)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("rows_per_request", [1, 3, 32])
+@pytest.mark.parametrize("arena_pages", [1, 4])
+@pytest.mark.parametrize("host_backing", [False, True])
+def test_qsa_unused_poisoned_pages_do_not_leak_into_direct_or_staged_attention(
+    rows_per_request, arena_pages, host_backing
+):
+    """Real selection expansion must exclude dirty free pages and causal tails."""
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    torch.manual_seed(173)
+    page_size, head_dim, kv_heads, query_heads = 3504, 256, 2, 32
+    lengths = [17, 7101]
+    tables = [[5, 1, 6], [4, 2, 7]]
+    backing = torch.full(
+        (8, kv_heads, page_size, 2 * head_dim),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cpu" if host_backing else "cuda",
+        pin_memory=host_backing,
+    )
+    # Page zero and the unused portions of every live page remain poisoned.
+    for length, table in zip(lengths, tables):
+        for logical, physical in enumerate(table):
+            count = min(page_size, max(0, length - logical * page_size))
+            if count:
+                backing[physical, :, :count].normal_()
+    cache = get_accelerator_view_from_cpu_tensor(backing) if host_backing else backing
+    rows = 2 * rows_per_request
+    query = torch.randn(
+        rows, query_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    positions = torch.cat(
+        [
+            torch.linspace(0, length - 1, rows_per_request, device="cuda").to(
+                torch.int32
+            )
+            if rows_per_request > 1
+            else torch.tensor([length - 1], device="cuda", dtype=torch.int32)
+            for length in lengths
+        ]
+    )
+    visible = (positions + 1) // 4
+    selected = torch.full((rows, 512), -1, dtype=torch.int32, device="cuda")
+    for row, count in enumerate(visible.tolist()):
+        count_selected = min(count, 512)
+        selected[row, :count_selected] = torch.randperm(count, device="cuda")[
+            :count_selected
+        ]
+    packed = torch.full((rows, 2052), 1234567, dtype=torch.int32, device="cuda")
+    qsa_indexer_ops.expand_qsa_block_indices(
+        selected, positions, visible, 4, 2048, packed
+    )
+    columns = torch.arange(2051, device="cuda")
+    assert bool((packed[:, :2051][columns[None, :] >= packed[:, -1:]] == -1).all())
+    block_table = torch.tensor(tables, dtype=torch.int32, device="cuda")
+    request_ids = (
+        torch.arange(rows, device="cuda", dtype=torch.int32) // rows_per_request
+    )
+    keys, values = cache.transpose(1, 2).split(head_dim, dim=-1)
+    reference_cache = backing.to("cuda")
+    ref_keys, ref_values = reference_cache.transpose(1, 2).split(head_dim, dim=-1)
+    expected = _qsa_sparse_paged_attention_reference(
+        query,
+        ref_keys,
+        ref_values,
+        packed[:, :2051],
+        block_table,
+        request_ids,
+        head_dim**-0.5,
+    )
+    direct = qsa_ops.qsa_sparse_paged_attention(
+        query,
+        keys,
+        values,
+        packed,
+        block_table,
+        request_ids,
+        use_prefill_config=rows_per_request > 3,
+    )
+    arena = torch.empty(
+        (arena_pages, *cache.shape[1:]), device="cuda", dtype=cache.dtype
+    )
+    staged = torch.full_like(query, float("nan"))
+    for request, length in enumerate(lengths):
+        request_rows = torch.arange(
+            request * rows_per_request,
+            (request + 1) * rows_per_request,
+            device="cuda",
+            dtype=torch.int64,
+        )
+        qsa_ops.qsa_sparse_paged_attention_staged(
+            query,
+            cache,
+            packed,
+            block_table[request],
+            request_rows,
+            (length - 1) // page_size,
+            arena,
+            rows_per_request > 3,
+            staged,
+        )
+    assert bool(torch.isfinite(direct).all())
+    assert bool(torch.isfinite(staged).all())
+    torch.testing.assert_close(direct, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(staged, expected, rtol=2e-2, atol=2e-2)
+    # Negative control: poisoning a genuinely selected value must be visible.
+    token = int(packed[0, 0])
+    backing[tables[0][token // page_size], :, token % page_size, head_dim:] = float(
+        "nan"
+    )
+    bad = qsa_ops.qsa_sparse_paged_attention(
+        query,
+        keys,
+        values,
+        packed,
+        block_table,
+        request_ids,
+        False,
+    )
+    assert not bool(torch.isfinite(bad[0]).all())
 
 
 @requires_qsa_kernels

@@ -8,6 +8,7 @@ import torch
 from transformers import PretrainedConfig
 
 from vllm.config.ec_transfer import ECRole, ECTransferConfig
+from vllm.config.kv_transfer import KVTransferConfig
 from vllm.config.model import ModelConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.vllm import VllmConfig
@@ -15,6 +16,34 @@ from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+
+@pytest.mark.parametrize("connector,role,ec_consumer,explicit,expected_allowed,expected_enabled", [
+    (None, None, False, False, False, False),
+    ("OffloadingConnector", "kv_both", False, False, False, False),
+    ("OffloadingConnector", "kv_both", False, True, False, True),
+    ("OffloadingConnector", "kv_both", True, False, True, True),
+    ("NixlConnector", "kv_consumer", False, False, True, True),
+    ("NixlConnector", "kv_producer", False, False, False, False),
+    ("NixlConnector", "kv_both", False, False, True, True),
+    ("MultiConnector", "kv_both", False, False, True, True),
+])
+def test_local_offload_preserves_embedding_input_policy(
+    connector, role, ec_consumer, explicit, expected_allowed, expected_enabled,
+):
+    """Local retention must not silently switch a text runner to MM embedding mode."""
+    from types import SimpleNamespace
+
+    mm = MultiModalConfig(enable_mm_embeds=explicit)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=mm),
+        ec_transfer_config=SimpleNamespace(is_ec_consumer=ec_consumer),
+        kv_transfer_config=KVTransferConfig(kv_connector=connector, kv_role=role)
+        if connector else None,
+    )
+    VllmConfig._resolve_mm_embedding_inputs(config)
+    assert mm.allow_missing_mm_embeddings == expected_allowed
+    assert mm.enable_mm_embeds == expected_enabled
 
 
 def test_mm_encoder_attn_backend_str_conversion():

@@ -1,4 +1,4 @@
-"""Run preserved CPU contract tests without importing the GPU engine package."""
+"""Run CPU contract tests; native tests also need installed engine dependencies."""
 
 import sys
 import unittest

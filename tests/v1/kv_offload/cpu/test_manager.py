@@ -42,6 +42,7 @@ def make_cpu_manager(
     enable_events: bool = False,
     store_threshold: int = 0,
     max_tracker_size: int = 64_000,
+    idle_ttl_seconds: float | None = None,
 ) -> CPUOffloadingManager:
     return CPUOffloadingManager(
         num_chunks=num_chunks,
@@ -50,6 +51,7 @@ def make_cpu_manager(
         enable_events=enable_events,
         store_threshold=store_threshold,
         max_tracker_size=max_tracker_size,
+        idle_ttl_seconds=idle_ttl_seconds,
     )
 
 
@@ -77,6 +79,141 @@ def to_key(int_hash: int) -> OffloadKey:
 
 def to_keys(int_hashes: list[int]) -> list[OffloadKey]:
     return [to_key(i) for i in int_hashes]
+
+
+@pytest.fixture
+def idle_clock(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("vllm.v1.kv_offload.cpu.manager.monotonic", lambda: now[0])
+    return now
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_idle_expiry_starts_after_store_and_reuses_only_expired_slot(
+    idle_clock, cache_policy
+):
+    manager = make_cpu_manager(
+        num_chunks=1,
+        cache_policy=cache_policy,
+        idle_ttl_seconds=3600,
+        enable_events=True,
+    )
+    stored = manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 7200
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT_PENDING
+    assert manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX) is None
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 10799
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT
+    idle_clock[0] = 10800
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.MISS
+    reused = manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX)
+    assert stored is not None and reused is not None
+    np.testing.assert_array_equal(
+        stored.store_spec.chunk_ids, reused.store_spec.chunk_ids
+    )
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.MISS
+    verify_events(
+        manager.take_events(), expected_stores=({1},), expected_evictions=({1},)
+    )
+    metric = CPUOffloadingMetrics.CPU_CACHE_EXPIRED_CHUNKS
+    assert manager.get_stats().reduce()[metric] == 1
+    assert manager.get_stats().reduce()[metric] == 0
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_idle_expiry_never_recycles_overlapping_loads(idle_clock, cache_policy):
+    manager = make_cpu_manager(
+        num_chunks=1, cache_policy=cache_policy, idle_ttl_seconds=3600
+    )
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 3599
+    manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 10000
+    manager.get_stats()
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT
+    manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 20000
+    assert manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX) is None
+    manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 23599
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT
+    idle_clock[0] = 23600
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.MISS
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_idle_touch_refreshes_live_prefix_but_cannot_resurrect_expired(
+    idle_clock, cache_policy
+):
+    manager = make_cpu_manager(cache_policy=cache_policy, idle_ttl_seconds=3600)
+    manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 3500
+    manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 3600
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) == LookupResult.MISS
+    manager.touch(to_keys([2]), _EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) == LookupResult.MISS
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT
+    idle_clock[0] = 7100
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.MISS
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_idle_deadlines_do_not_follow_recycled_or_reset_chunks(
+    idle_clock, cache_policy
+):
+    manager = make_cpu_manager(
+        num_chunks=1, cache_policy=cache_policy, idle_ttl_seconds=3600
+    )
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 1000
+    manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([2]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 3600
+    manager.on_new_request(_EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) == LookupResult.HIT
+    manager.reset_cache()
+    manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([3]), _EMPTY_REQ_CTX, success=False)
+    manager.prepare_store(to_keys([4]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([4]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 4600
+    manager.on_new_request(_EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(4), _EMPTY_REQ_CTX) == LookupResult.HIT
+    idle_clock[0] = 7200
+    assert manager.lookup(to_key(4), _EMPTY_REQ_CTX) == LookupResult.MISS
+
+
+@pytest.mark.parametrize("ttl", [0, -1, True, float("nan"), float("inf"), "3600"])
+def test_idle_expiry_rejects_invalid_configuration(ttl):
+    with pytest.raises(ValueError, match="finite positive"):
+        make_cpu_manager(idle_ttl_seconds=ttl)
+
+
+def test_idle_expiry_disabled_preserves_existing_cache(idle_clock):
+    manager = make_cpu_manager()
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 1000000
+    manager.on_new_request(_EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT
+
+
+def test_idle_deadline_between_lookup_and_native_touch_keeps_offered_hit(idle_clock):
+    manager = make_cpu_manager(idle_ttl_seconds=3600)
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    idle_clock[0] = 3599.99
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT
+    idle_clock[0] = 3600.01
+    manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+    verify_load_output(manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX), [0])
+    manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)
 
 
 def verify_store_output(

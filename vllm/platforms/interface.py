@@ -110,9 +110,27 @@ def _qsa_offload_block_size(vllm_config: "VllmConfig", mamba_page_size: int):
     # Smaller attention pages can avoid a pinned-host allocator size-class jump
     # when the shared GPU pool grows to hold speculative recurrent states.
     cap = int(os.environ.get("VLLM_QSA_OFFLOAD_BLOCK_SIZE_CAP", "0"))
+    override = int(os.environ.get("VLLM_FLASH_QSA_BLOCK_SIZE", "0"))
+    if override:
+        if (
+            override not in (944, 1024, 2048)
+            or cap
+            or vllm_config.parallel_config.tensor_parallel_size != 4
+            or pp_size != 1
+            or text_config.model_type != "qwen4_exp_text"
+        ):
+            raise ValueError(
+                "QSA block experiment requires TP4/PP1 Qwen4Exp, 944/1024/2048, no cap"
+            )
+        # Deliberately allow a wider attention group. Native block-outermost
+        # grouping computes its physical stride and packs recurrent states;
+        # do not alter cache ownership or pad every recurrent state ourselves.
+        return override
     if cap:
         if cap < 16 or cap % 16 or cap > block_size:
-            raise ValueError("QSA offload page cap must be a multiple of 16 <= auto size")
+            raise ValueError(
+                "QSA offload page cap must be a multiple of 16 <= auto size"
+            )
         block_size = cap
     return block_size if block_size >= 16 else None
 

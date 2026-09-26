@@ -17,6 +17,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.mamba.ops.flash_next_prefill_checkpoint import (
+    enable_checkpoint_spec,
+    store_checkpoint_history,
+)
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -177,6 +181,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
         return PleShortConvAttentionBackend
+
+    def get_kv_cache_spec(self, vllm_config):
+        return enable_checkpoint_spec(
+            super().get_kv_cache_spec(vllm_config), vllm_config, "triton"
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return MambaStateDtypeCalculator.short_conv_state_dtype(
@@ -364,6 +373,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                     f"expect at least {state_capacity}."
                 )
             conv_state = conv_state[..., -state_capacity:]
+        if layer_attn_metadata.prefill_checkpoint is not None:
+            store_checkpoint_history(
+                inputs, conv_state, layer_attn_metadata.prefill_checkpoint,
+                self.conv_state_len,
+            )
         self._short_conv_dilated_dispatch(
             inputs=inputs,
             residual=residual,
